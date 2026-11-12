@@ -6,6 +6,9 @@ on:
     paths: ['vseti/**', '.github/workflows/vseti-build.yml']
 permissions:
   contents: write
+concurrency:
+  group: vseti-build
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -19,6 +22,7 @@ jobs:
           git clone -q https://github.com/teamgram/teamgram-server.git src
           git -C src checkout -q "$(cat fork/vseti/server.base)"
           git -C src apply --whitespace=nowarn ../fork/vseti/server.patch
+          for p in $(ls fork/vseti/server.*.patch 2>/dev/null | sort -V); do echo "доп. патч $p"; git -C src apply --whitespace=nowarn "../$p"; done
           git clone -q https://github.com/teamgram/proto.git tgproto
           git -C tgproto checkout -q "$(cat fork/vseti/proto.base)"
           git -C tgproto apply --whitespace=nowarn ../fork/vseti/proto.patch
@@ -31,7 +35,7 @@ jobs:
         run: |
           set -e
           mkdir -p ../out
-          for t in bff:./app/bff/bff/cmd/bff biz:./app/service/biz/biz/cmd/biz msg:./app/messenger/msg/cmd/msg sync:./app/messenger/sync/cmd/sync dfs:./app/service/dfs/cmd/dfs; do
+          for t in bff:./app/bff/bff/cmd/bff biz:./app/service/biz/biz/cmd/biz msg:./app/messenger/msg/cmd/msg sync:./app/messenger/sync/cmd/sync dfs:./app/service/dfs/cmd/dfs vsstickers:./app/tools/vsstickers; do
             n=${t%%:*}; p=${t#*:}
             CGO_ENABLED=1 GOFLAGS=-mod=mod go build -ldflags "-s -w" -o ../out/$n $p
             sha256sum ../out/$n | cut -c1-64 > ../out/$n.sha
@@ -39,6 +43,14 @@ jobs:
           done
           echo "${GITHUB_SHA}" > ../out/commit.txt
           ls -la ../out
+      - name: наборы стикеров (Noto Animated Emoji, CC BY 4.0)
+        run: |
+          set -e
+          python3 fork/vseti/stickers/gen.py stk/bundle
+          tar -C stk -cf out/stickers.tar bundle
+          sha256sum out/stickers.tar | cut -c1-64 > out/stickers.sha
+          cp fork/vseti/vm/*.sh out/
+          ls -la out
       - name: release
         working-directory: fork
         env:
