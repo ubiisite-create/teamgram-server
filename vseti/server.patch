@@ -1,0 +1,2042 @@
+diff --git a/app/bff/bff/internal/server/server.go b/app/bff/bff/internal/server/server.go
+index 05f4a12..0a42eaf 100644
+--- a/app/bff/bff/internal/server/server.go
++++ b/app/bff/bff/internal/server/server.go
+@@ -149,9 +149,7 @@ func (s *Server) Initialize() error {
+ 			}))
+ 
+ 		// chats_helper
+-		mtproto.RegisterRPCChatsServer(
+-			grpcServer,
+-			chats_helper.New(chats_helper.Config{
++		vsChatsSvc := chats_helper.New(chats_helper.Config{
+ 				RpcServerConf:     c.RpcServerConf,
+ 				UserClient:        c.BizServiceClient,
+ 				ChatClient:        c.BizServiceClient,
+@@ -162,7 +160,8 @@ func (s *Server) Initialize() error {
+ 				AuthsessionClient: c.AuthSessionClient,
+ 				IdgenClient:       c.IdgenClient,
+ 				MessageClient:     c.BizServiceClient,
+-			}))
++			})
++		mtproto.RegisterRPCChatsServer(grpcServer, vsChatsSvc)
+ 
+ 		// files_helper
+ 		mtproto.RegisterRPCFilesServer(
+@@ -238,9 +237,7 @@ func (s *Server) Initialize() error {
+ 			}))
+ 
+ 		// messages_helper
+-		mtproto.RegisterRPCMessagesServer(
+-			grpcServer,
+-			messages_helper.New(messages_helper.Config{
++		vsMessagesSvc := messages_helper.New(messages_helper.Config{
+ 				RpcServerConf: c.RpcServerConf,
+ 				UserClient:    c.BizServiceClient,
+ 				ChatClient:    c.BizServiceClient,
+@@ -250,7 +247,8 @@ func (s *Server) Initialize() error {
+ 				MessageClient: c.BizServiceClient,
+ 				MediaClient:   c.MediaClient,
+ 				SyncClient:    c.SyncClient,
+-			}, nil))
++			}, nil)
++		mtproto.RegisterRPCMessagesServer(grpcServer, vsMessagesSvc)
+ 
+ 		// notification_helper
+ 		mtproto.RegisterRPCNotificationServer(
+@@ -360,7 +358,14 @@ func (s *Server) Initialize() error {
+ 			webbrowserhelper.New(webbrowserhelper.Config{
+ 				RpcServerConf: c.RpcServerConf,
+ 			}))
++
++		// VSети: каналы и супергруппы поверх групп
++		mtproto.RegisterRPCChannelsServer(grpcServer, newVsChannels(vsChatsSvc, vsMessagesSvc))
++		mtproto.RegisterRPCFragmentServer(grpcServer, vsFragment{})
++		mtproto.RegisterRPCReactionsServer(grpcServer, vsReactions{})
++		mtproto.RegisterRPCWebPageServer(grpcServer, vsWebPage{})
+ 	})
++	initVsChannels(s.grpcSrv, c)
+ 
+ 	// logx.Must(err)
+ 
+diff --git a/app/bff/bff/internal/server/vs_channels.go b/app/bff/bff/internal/server/vs_channels.go
+new file mode 100644
+index 0000000..e88b125
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_channels.go
+@@ -0,0 +1,599 @@
++// VSети: каналы и супергруппы поверх обычных групп Teamgram (см. pkg/vschan).
++package server
++
++import (
++	"github.com/teamgram/teamgram-server/pkg/vswebpage"
++	sync_client "github.com/teamgram/teamgram-server/app/messenger/sync/client"
++	kafka "github.com/teamgram/marmota/pkg/mq"
++	"fmt"
++
++	"github.com/zeromicro/go-zero/core/stores/kv"
++	messagepb "github.com/teamgram/teamgram-server/app/service/biz/message/message"
++	message_client "github.com/teamgram/teamgram-server/app/service/biz/message/client"
++	"math/rand"
++
++	msgpb "github.com/teamgram/teamgram-server/app/messenger/msg/msg/msg"
++	msg_client "github.com/teamgram/teamgram-server/app/messenger/msg/msg/client"
++	"context"
++
++	"github.com/teamgram/marmota/pkg/net/rpcx"
++	"github.com/teamgram/proto/mtproto"
++	"github.com/teamgram/proto/mtproto/rpc/metadata"
++	"github.com/teamgram/teamgram-server/app/bff/bff/internal/config"
++	chatpb "github.com/teamgram/teamgram-server/app/service/biz/chat/chat"
++	chat_client "github.com/teamgram/teamgram-server/app/service/biz/chat/client"
++	dialogpb "github.com/teamgram/teamgram-server/app/service/biz/dialog/dialog"
++	dialog_client "github.com/teamgram/teamgram-server/app/service/biz/dialog/client"
++	userpb "github.com/teamgram/teamgram-server/app/service/biz/user/user"
++	user_client "github.com/teamgram/teamgram-server/app/service/biz/user/client"
++	"github.com/teamgram/teamgram-server/pkg/vschan"
++
++	"github.com/zeromicro/go-zero/core/logx"
++	"github.com/zeromicro/go-zero/zrpc"
++	"google.golang.org/grpc"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++var (
++	vsKV        kv.Store
++	vsMessageCli message_client.MessageClient
++	vsMsgCli    msg_client.MsgClient
++	vsChatCli   chat_client.ChatClient
++	vsDialogCli dialog_client.DialogClient
++	vsUserCli   user_client.UserClient
++)
++
++// initVsChannels — клиенты, резолвер и перехватчик запросов/ответов bff.
++func initVsChannels(srv *zrpc.RpcServer, c config.Config) {
++	cli := rpcx.GetCachedRpcClient(c.BizServiceClient)
++	vsChatCli = chat_client.NewChatClient(cli)
++	vsMessageCli = message_client.NewMessageClient(cli)
++	vsKV = kv.NewStore(c.KV)
++	vswebpage.SetDfsEtcd(c.DfsClient.Etcd.Hosts)
++	if c.SyncClient != nil {
++		vsSyncCli = sync_client.NewSyncMqClient(kafka.MustKafkaProducer(c.SyncClient))
++	}
++	vsMsgCli = msg_client.NewMsgClient(rpcx.GetCachedRpcClient(c.MsgClient))
++	vsDialogCli = dialog_client.NewDialogClient(cli)
++	vsUserCli = user_client.NewUserClient(cli)
++	mtproto.VsSetChannelUsernameFetcher(func(id int64) string {
++		u, err := vsUserCli.UserGetChannelUsername(context.Background(), &userpb.TLUserGetChannelUsername{ChannelId: id})
++		if err != nil || u == nil {
++			return ""
++		}
++		return u.GetUsername()
++	})
++	vschan.Default = vschan.NewResolver(func(ctx context.Context, chatId int64) int32 {
++		chat, err := vsChatCli.ChatGetMutableChat(context.Background(), &chatpb.TLChatGetMutableChat{ChatId: chatId})
++		if err != nil || chat == nil {
++			return 0
++		}
++		return mtproto.VsKind(chat.GetChat().GetAvailableReactionsType())
++	})
++	srv.AddUnaryInterceptors(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
++		vschan.RewriteIn(req)
++		// VSети: просмотры постов канала
++		if r, ok := req.(*mtproto.TLMessagesGetMessagesViews); ok {
++			if rv, handled := vsGetViews(ctx, r); handled {
++				vschan.Default.RewriteOut(ctx, rv)
++				return rv, nil
++			}
++		}
++		resp, err := handler(ctx, req)
++		if err == nil && resp != nil {
++			vschan.Default.RewriteOut(ctx, resp)
++		}
++		return resp, err
++	})
++}
++
++type vsChannels struct {
++	mtproto.UnimplementedRPCChannelsServer
++	chats    mtproto.RPCChatsServer
++	messages mtproto.RPCMessagesServer
++}
++
++func newVsChannels(chats mtproto.RPCChatsServer, messages mtproto.RPCMessagesServer) *vsChannels {
++	return &vsChannels{chats: chats, messages: messages}
++}
++
++func vsMD(ctx context.Context) *metadata.RpcMetadata { return metadata.RpcMetadataFromIncoming(ctx) }
++
++func vsInputChannelId(ch *mtproto.InputChannel) int64 {
++	if ch == nil {
++		return 0
++	}
++	return ch.GetChannelId()
++}
++
++func vsInputPeerChat(id int64) *mtproto.InputPeer {
++	return mtproto.MakeTLInputPeerChat(&mtproto.InputPeer{ChatId: id}).To_InputPeer()
++}
++
++func (s *vsChannels) getChannel(ctx context.Context, ch *mtproto.InputChannel) (*mtproto.MutableChat, error) {
++	id := vsInputChannelId(ch)
++	if id == 0 {
++		return nil, mtproto.ErrChannelInvalid
++	}
++	chat, err := vsChatCli.ChatGetMutableChat(ctx, &chatpb.TLChatGetMutableChat{ChatId: id})
++	if err != nil || chat == nil || !chat.IsVsChannel() {
++		return nil, mtproto.ErrChannelInvalid
++	}
++	return chat, nil
++}
++
++// ChannelsCreateChannel — канал (broadcast) или супергруппа (megagroup), сразу без участников.
++func (s *vsChannels) ChannelsCreateChannel(ctx context.Context, in *mtproto.TLChannelsCreateChannel) (*mtproto.Updates, error) {
++	prefix, kind := mtproto.VsTitlePrefixMegagroup, mtproto.VsKindMegagroup
++	if in.GetBroadcast() {
++		prefix, kind = mtproto.VsTitlePrefixBroadcast, mtproto.VsKindBroadcast
++	}
++	if in.GetTitle() == "" {
++		return nil, mtproto.ErrChatTitleEmpty
++	}
++	r, err := s.chats.MessagesCreateChat92CEDDD4(ctx, &mtproto.TLMessagesCreateChat92CEDDD4{
++		Title:     prefix + in.GetTitle(),
++		TtlPeriod: in.GetTtlPeriod(),
++	})
++	if err != nil {
++		logx.WithContext(ctx).Errorf("channels.createChannel - error: %v", err)
++		return nil, err
++	}
++	upd := r.GetUpdates()
++	for _, ch := range upd.GetChats() {
++		vschan.Default.Remember(ch.GetId(), kind)
++		if in.GetAbout() != "" {
++			_, _ = s.chats.MessagesEditChatAbout(ctx, &mtproto.TLMessagesEditChatAbout{
++				Peer:  vsInputPeerChat(ch.GetId()),
++				About: in.GetAbout(),
++			})
++		}
++	}
++	return upd, nil
++}
++
++func (s *vsChannels) ChannelsGetChannels(ctx context.Context, in *mtproto.TLChannelsGetChannels) (*mtproto.Messages_Chats, error) {
++	md := vsMD(ctx)
++	rV := mtproto.MakeTLMessagesChats(&mtproto.Messages_Chats{Chats: []*mtproto.Chat{}}).To_Messages_Chats()
++	for _, ch := range in.GetId() {
++		if chat, err := s.getChannel(ctx, ch); err == nil {
++			rV.Chats = append(rV.Chats, chat.ToUnsafeChat(md.UserId))
++		}
++	}
++	return rV, nil
++}
++
++func (s *vsChannels) ChannelsGetFullChannel(ctx context.Context, in *mtproto.TLChannelsGetFullChannel) (*mtproto.Messages_ChatFull, error) {
++	md := vsMD(ctx)
++	chat, err := s.getChannel(ctx, in.GetChannel())
++	if err != nil {
++		return nil, err
++	}
++	var (
++		count, admins int32
++		idList        []int64
++	)
++	chat.Walk(func(userId int64, p *mtproto.ImmutableChatParticipant) error {
++		if p.IsChatMemberStateNormal() {
++			count++
++			idList = append(idList, p.UserId)
++			if p.IsChatMemberCreator() || p.IsChatMemberAdmin() {
++				admins++
++			}
++		}
++		return nil
++	})
++
++	full := &mtproto.ChatFull{
++		CanViewParticipants: true,
++		CanSetUsername:      true,
++		CanDeleteChannel:    chat.GetChat().GetCreator() == md.UserId,
++		Id:                  chat.Id(),
++		About:               chat.About(),
++		ParticipantsCount:   &wrapperspb.Int32Value{Value: count},
++		AdminsCount:         &wrapperspb.Int32Value{Value: admins},
++		ChatPhoto:           chat.Photo(),
++		Pts:                 1,
++	}
++	if full.ChatPhoto == nil {
++		full.ChatPhoto = mtproto.MakeTLPhotoEmpty(nil).To_Photo()
++	}
++	// прочитано/не прочитано — из диалога пользователя
++	if dl, _ := vsDialogCli.DialogGetDialogsByIdList(ctx, &dialogpb.TLDialogGetDialogsByIdList{
++		UserId: md.UserId,
++		IdList: []int64{mtproto.MakePeerDialogId(mtproto.PEER_CHAT, chat.Id())},
++	}); dl != nil && len(dl.Datas) > 0 {
++		d := dl.Datas[0].GetDialog()
++		full.ReadInboxMaxId = d.GetReadInboxMaxId()
++		full.ReadOutboxMaxId = d.GetReadOutboxMaxId()
++		full.UnreadCount = d.GetUnreadCount()
++		full.FolderId = d.GetFolderId()
++	}
++	if ns, _ := vsUserCli.UserGetNotifySettings(ctx, &userpb.TLUserGetNotifySettings{
++		UserId: md.UserId, PeerType: mtproto.PEER_CHAT, PeerId: chat.Id(),
++	}); ns != nil {
++		full.NotifySettings = ns
++	} else {
++		full.NotifySettings = mtproto.MakeTLPeerNotifySettings(nil).To_PeerNotifySettings()
++	}
++	if me, ok := chat.GetImmutableChatParticipant(md.UserId); ok && me.Link != "" &&
++		(me.IsChatMemberCreator() || me.IsChatMemberAdmin()) {
++		full.ExportedInvite, _ = vsChatCli.ChatGetExportedChatInvite(ctx, &chatpb.TLChatGetExportedChatInvite{
++			ChatId: chat.Id(), Link: me.Link,
++		})
++	}
++	rV := mtproto.MakeTLMessagesChatFull(&mtproto.Messages_ChatFull{
++		FullChat: mtproto.MakeTLChannelFull(full).To_ChatFull(),
++		Chats:    []*mtproto.Chat{chat.ToUnsafeChat(md.UserId)},
++		Users:    []*mtproto.User{},
++	}).To_Messages_ChatFull()
++	if mUsers, _ := vsUserCli.UserGetMutableUsers(ctx, &userpb.TLUserGetMutableUsers{Id: idList}); mUsers != nil {
++		rV.Users = mUsers.GetUserListByIdList(md.UserId, idList...)
++	}
++	return rV, nil
++}
++
++func vsChannelParticipant(p *mtproto.ImmutableChatParticipant, selfId int64) *mtproto.ChannelParticipant {
++	cp := &mtproto.ChannelParticipant{
++		UserId:              p.UserId,
++		Date:                int32(p.InvitedAt),
++		InviterId_INT64:     p.InviterUserId,
++		InviterId_FLAGINT64: mtproto.MakeFlagsInt64(p.InviterUserId),
++		PromotedBy:          p.InviterUserId,
++		Self:                p.UserId == selfId,
++	}
++	if cp.Date == 0 {
++		cp.Date = int32(p.Date)
++	}
++	switch {
++	case p.IsChatMemberCreator():
++		cp.AdminRights = mtproto.VsFullAdminRights(true)
++		return mtproto.MakeTLChannelParticipantCreator(cp).To_ChannelParticipant()
++	case p.IsChatMemberAdmin():
++		cp.AdminRights = p.GetAdminRights()
++		if cp.AdminRights == nil {
++			cp.AdminRights = mtproto.VsFullAdminRights(false)
++		}
++		cp.CanEdit = true
++		return mtproto.MakeTLChannelParticipantAdmin(cp).To_ChannelParticipant()
++	case p.UserId == selfId:
++		return mtproto.MakeTLChannelParticipantSelf(cp).To_ChannelParticipant()
++	}
++	return mtproto.MakeTLChannelParticipant(cp).To_ChannelParticipant()
++}
++
++func (s *vsChannels) ChannelsGetParticipants(ctx context.Context, in *mtproto.TLChannelsGetParticipants) (*mtproto.Channels_ChannelParticipants, error) {
++	md := vsMD(ctx)
++	chat, err := s.getChannel(ctx, in.GetChannel())
++	if err != nil {
++		return nil, err
++	}
++	adminsOnly := in.GetFilter().GetPredicateName() == mtproto.Predicate_channelParticipantsAdmins
++	if fp := in.GetFilter().GetPredicateName(); fp == mtproto.Predicate_channelParticipantsKicked ||
++		fp == mtproto.Predicate_channelParticipantsBanned || fp == mtproto.Predicate_channelParticipantsBots {
++		return mtproto.MakeTLChannelsChannelParticipants(&mtproto.Channels_ChannelParticipants{
++			Participants: []*mtproto.ChannelParticipant{}, Chats: []*mtproto.Chat{}, Users: []*mtproto.User{},
++		}).To_Channels_ChannelParticipants(), nil
++	}
++	var (
++		all    []*mtproto.ChannelParticipant
++		idList []int64
++	)
++	chat.Walk(func(userId int64, p *mtproto.ImmutableChatParticipant) error {
++		if !p.IsChatMemberStateNormal() {
++			return nil
++		}
++		if adminsOnly && !p.IsChatMemberCreator() && !p.IsChatMemberAdmin() {
++			return nil
++		}
++		all = append(all, vsChannelParticipant(p, md.UserId))
++		idList = append(idList, p.UserId)
++		return nil
++	})
++	count := int32(len(all))
++	off, lim := int(in.GetOffset()), int(in.GetLimit())
++	if off > len(all) {
++		off = len(all)
++	}
++	if lim <= 0 || off+lim > len(all) {
++		lim = len(all) - off
++	}
++	page, pageIds := all[off:off+lim], idList[off:off+lim]
++	rV := mtproto.MakeTLChannelsChannelParticipants(&mtproto.Channels_ChannelParticipants{
++		Count: count, Participants: page, Chats: []*mtproto.Chat{}, Users: []*mtproto.User{},
++	}).To_Channels_ChannelParticipants()
++	if mUsers, _ := vsUserCli.UserGetMutableUsers(ctx, &userpb.TLUserGetMutableUsers{Id: pageIds}); mUsers != nil {
++		rV.Users = mUsers.GetUserListByIdList(md.UserId, pageIds...)
++	}
++	return rV, nil
++}
++
++func (s *vsChannels) ChannelsGetParticipant(ctx context.Context, in *mtproto.TLChannelsGetParticipant) (*mtproto.Channels_ChannelParticipant, error) {
++	md := vsMD(ctx)
++	chat, err := s.getChannel(ctx, in.GetChannel())
++	if err != nil {
++		return nil, err
++	}
++	uid := in.GetParticipant().GetUserId()
++	if in.GetParticipant().GetPredicateName() == mtproto.Predicate_inputPeerSelf || uid == 0 {
++		uid = md.UserId
++	}
++	p, ok := chat.GetImmutableChatParticipant(uid)
++	if !ok || !p.IsChatMemberStateNormal() {
++		return nil, mtproto.ErrUserNotParticipant
++	}
++	rV := mtproto.MakeTLChannelsChannelParticipant(&mtproto.Channels_ChannelParticipant{
++		Participant: vsChannelParticipant(p, md.UserId), Chats: []*mtproto.Chat{}, Users: []*mtproto.User{},
++	}).To_Channels_ChannelParticipant()
++	if mUsers, _ := vsUserCli.UserGetMutableUsers(ctx, &userpb.TLUserGetMutableUsers{Id: []int64{uid}}); mUsers != nil {
++		rV.Users = mUsers.GetUserListByIdList(md.UserId, uid)
++	}
++	return rV, nil
++}
++
++func (s *vsChannels) ChannelsReadHistory(ctx context.Context, in *mtproto.TLChannelsReadHistory) (*mtproto.Bool, error) {
++	_, err := s.messages.MessagesReadHistory(ctx, &mtproto.TLMessagesReadHistory{
++		Peer:  vsInputPeerChat(vsInputChannelId(in.GetChannel())),
++		MaxId: in.GetMaxId(),
++	})
++	if err != nil {
++		return nil, err
++	}
++	return mtproto.BoolTrue, nil
++}
++
++func (s *vsChannels) ChannelsReadMessageContents(ctx context.Context, in *mtproto.TLChannelsReadMessageContents) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (s *vsChannels) ChannelsGetMessages(ctx context.Context, in *mtproto.TLChannelsGetMessages) (*mtproto.Messages_Messages, error) {
++	return s.messages.MessagesGetMessages(ctx, &mtproto.TLMessagesGetMessages{
++		Id_VECTORINPUTMESSAGE: in.GetId_VECTORINPUTMESSAGE(),
++		Id_VECTORINT32:        in.GetId_VECTORINT32(),
++	})
++}
++
++func (s *vsChannels) ChannelsDeleteMessages(ctx context.Context, in *mtproto.TLChannelsDeleteMessages) (*mtproto.Messages_AffectedMessages, error) {
++	return s.messages.MessagesDeleteMessages(ctx, &mtproto.TLMessagesDeleteMessages{
++		Revoke: true,
++		Id:     in.GetId(),
++	})
++}
++
++func (s *vsChannels) ChannelsEditTitle(ctx context.Context, in *mtproto.TLChannelsEditTitle) (*mtproto.Updates, error) {
++	return s.chats.MessagesEditChatTitle(ctx, &mtproto.TLMessagesEditChatTitle{
++		ChatId: vsInputChannelId(in.GetChannel()),
++		Title:  in.GetTitle(),
++	})
++}
++
++func (s *vsChannels) ChannelsEditPhoto(ctx context.Context, in *mtproto.TLChannelsEditPhoto) (*mtproto.Updates, error) {
++	return s.chats.MessagesEditChatPhoto(ctx, &mtproto.TLMessagesEditChatPhoto{
++		ChatId: vsInputChannelId(in.GetChannel()),
++		Photo:  in.GetPhoto(),
++	})
++}
++
++func (s *vsChannels) ChannelsLeaveChannel(ctx context.Context, in *mtproto.TLChannelsLeaveChannel) (*mtproto.Updates, error) {
++	return s.chats.MessagesDeleteChatUser(ctx, &mtproto.TLMessagesDeleteChatUser{
++		ChatId: vsInputChannelId(in.GetChannel()),
++		UserId: mtproto.MakeTLInputUserSelf(nil).To_InputUser(),
++	})
++}
++
++func (s *vsChannels) ChannelsDeleteChannel(ctx context.Context, in *mtproto.TLChannelsDeleteChannel) (*mtproto.Updates, error) {
++	if _, err := s.chats.MessagesDeleteChat(ctx, &mtproto.TLMessagesDeleteChat{
++		ChatId: vsInputChannelId(in.GetChannel()),
++	}); err != nil {
++		return nil, err
++	}
++	return mtproto.MakeTLUpdates(&mtproto.Updates{
++		Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{},
++	}).To_Updates(), nil
++}
++
++func (s *vsChannels) ChannelsEditAdmin(ctx context.Context, in *mtproto.TLChannelsEditAdmin) (*mtproto.Updates, error) {
++	isAdmin := mtproto.BoolFalse
++	if r := in.GetAdminRights(); r != nil && (r.ChangeInfo || r.PostMessages || r.EditMessages || r.DeleteMessages ||
++		r.BanUsers || r.InviteUsers || r.PinMessages || r.AddAdmins || r.ManageCall || r.Other) {
++		isAdmin = mtproto.BoolTrue
++	}
++	if _, err := s.chats.MessagesEditChatAdmin(ctx, &mtproto.TLMessagesEditChatAdmin{
++		ChatId:  vsInputChannelId(in.GetChannel()),
++		UserId:  in.GetUserId(),
++		IsAdmin: isAdmin,
++	}); err != nil {
++		return nil, err
++	}
++	md := vsMD(ctx)
++	upd := mtproto.MakeTLUpdates(&mtproto.Updates{
++		Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{},
++	}).To_Updates()
++	if chat, err := s.getChannel(ctx, in.GetChannel()); err == nil {
++		upd.Chats = append(upd.Chats, chat.ToUnsafeChat(md.UserId))
++	}
++	return upd, nil
++}
++
++func (s *vsChannels) ChannelsExportMessageLink(ctx context.Context, in *mtproto.TLChannelsExportMessageLink) (*mtproto.ExportedMessageLink, error) {
++	return mtproto.MakeTLExportedMessageLink(&mtproto.ExportedMessageLink{
++		Link: "https://me.vsseti.ru/",
++		Html: "",
++	}).To_ExportedMessageLink(), nil
++}
++
++func (s *vsChannels) ChannelsGetAdminedPublicChannels(ctx context.Context, in *mtproto.TLChannelsGetAdminedPublicChannels) (*mtproto.Messages_Chats, error) {
++	return mtproto.MakeTLMessagesChats(&mtproto.Messages_Chats{Chats: []*mtproto.Chat{}}).To_Messages_Chats(), nil
++}
++
++func (s *vsChannels) ChannelsGetInactiveChannels(ctx context.Context, in *mtproto.TLChannelsGetInactiveChannels) (*mtproto.Messages_InactiveChats, error) {
++	return mtproto.MakeTLMessagesInactiveChats(&mtproto.Messages_InactiveChats{
++		Dates: []int32{}, Chats: []*mtproto.Chat{}, Users: []*mtproto.User{},
++	}).To_Messages_InactiveChats(), nil
++}
++
++func (s *vsChannels) ChannelsToggleSignatures(ctx context.Context, in *mtproto.TLChannelsToggleSignatures) (*mtproto.Updates, error) {
++	return mtproto.MakeTLUpdates(&mtproto.Updates{Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{}}).To_Updates(), nil
++}
++
++// vsJoin — пользователь сам вступает в канал/супергруппу (по @ссылке).
++func (s *vsChannels) vsJoin(ctx context.Context, chatId int64) (*mtproto.Updates, error) {
++	md := vsMD(ctx)
++	chat, err := vsChatCli.ChatGetMutableChat(ctx, &chatpb.TLChatGetMutableChat{ChatId: chatId})
++	if err != nil || chat == nil || !chat.IsVsChannel() {
++		return nil, mtproto.ErrChannelInvalid
++	}
++	if p, ok := chat.GetImmutableChatParticipant(md.UserId); ok && p.IsChatMemberStateNormal() {
++		return nil, mtproto.ErrUserAlreadyParticipant
++	}
++	// вступить сам можно только в публичный (с @именем)
++	if u, _ := vsUserCli.UserGetChannelUsername(ctx, &userpb.TLUserGetChannelUsername{ChannelId: chatId}); u == nil || u.GetUsername() == "" {
++		return nil, mtproto.ErrChannelPrivate
++	}
++	chat, err = vsChatCli.ChatAddChatUser(ctx, &chatpb.TLChatAddChatUser{
++		ChatId:    chatId,
++		InviterId: chat.Creator(),
++		UserId:    md.UserId,
++	})
++	if err != nil {
++		return nil, err
++	}
++	vschan.Default.Remember(chatId, mtproto.VsKind(chat.GetChat().GetAvailableReactionsType()))
++	return vsMsgCli.MsgSendMessageV2(ctx, &msgpb.TLMsgSendMessageV2{
++		UserId:    md.UserId,
++		AuthKeyId: md.PermAuthKeyId,
++		PeerType:  mtproto.PEER_CHAT,
++		PeerId:    chatId,
++		Message: []*msgpb.OutboxMessage{
++			msgpb.MakeTLOutboxMessage(&msgpb.OutboxMessage{
++				NoWebpage: true,
++				RandomId:  rand.Int63(),
++				Message:   chat.MakeMessageService(md.UserId, mtproto.MakeMessageActionChatAddUser(md.UserId)),
++			}).To_OutboxMessage(),
++		},
++	})
++}
++
++func (s *vsChannels) ChannelsJoinChannel7F6A1E22(ctx context.Context, in *mtproto.TLChannelsJoinChannel7F6A1E22) (*mtproto.Messages_ChatInviteJoinResult, error) {
++	upd, err := s.vsJoin(ctx, vsInputChannelId(in.GetChannel()))
++	if err != nil {
++		return nil, err
++	}
++	return mtproto.MakeTLMessagesChatInviteJoinResultOk(&mtproto.Messages_ChatInviteJoinResult{
++		Updates: upd,
++	}).To_Messages_ChatInviteJoinResult(), nil
++}
++
++func (s *vsChannels) ChannelsJoinChannel24B524C5(ctx context.Context, in *mtproto.TLChannelsJoinChannel24B524C5) (*mtproto.Updates, error) {
++	return s.vsJoin(ctx, vsInputChannelId(in.GetChannel()))
++}
++
++// vsInvite — админ добавляет людей в канал/супергруппу.
++func (s *vsChannels) vsInvite(ctx context.Context, ch *mtproto.InputChannel, users []*mtproto.InputUser) (*mtproto.Messages_InvitedUsers, error) {
++	chatId := vsInputChannelId(ch)
++	var last *mtproto.Updates
++	var firstErr error
++	for _, u := range users {
++		r, err := s.chats.MessagesAddChatUserCBC6D107(ctx, &mtproto.TLMessagesAddChatUserCBC6D107{
++			ChatId: chatId,
++			UserId: u,
++		})
++		if err != nil {
++			if firstErr == nil {
++				firstErr = err
++			}
++			continue
++		}
++		last = r.GetUpdates()
++	}
++	if last == nil {
++		if firstErr != nil {
++			return nil, firstErr
++		}
++		last = mtproto.MakeTLUpdates(&mtproto.Updates{Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{}}).To_Updates()
++	}
++	return mtproto.MakeTLMessagesInvitedUsers(&mtproto.Messages_InvitedUsers{
++		Updates:         last,
++		MissingInvitees: []*mtproto.MissingInvitee{},
++	}).To_Messages_InvitedUsers(), nil
++}
++
++func (s *vsChannels) ChannelsInviteToChannelC9E33D54(ctx context.Context, in *mtproto.TLChannelsInviteToChannelC9E33D54) (*mtproto.Messages_InvitedUsers, error) {
++	return s.vsInvite(ctx, in.GetChannel(), in.GetUsers())
++}
++
++func (s *vsChannels) ChannelsInviteToChannel199F3A6C(ctx context.Context, in *mtproto.TLChannelsInviteToChannel199F3A6C) (*mtproto.Updates, error) {
++	r, err := s.vsInvite(ctx, in.GetChannel(), in.GetUsers())
++	if err != nil {
++		return nil, err
++	}
++	return r.GetUpdates(), nil
++}
++
++// VSети: «фрагмент»-методы имён (несколько @имён у Telegram). У нас одно имя — подтверждаем.
++type vsFragment struct {
++	mtproto.UnimplementedRPCFragmentServer
++}
++
++func (vsFragment) ChannelsDeactivateAllUsernames(ctx context.Context, in *mtproto.TLChannelsDeactivateAllUsernames) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsFragment) ChannelsReorderUsernames(ctx context.Context, in *mtproto.TLChannelsReorderUsernames) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsFragment) ChannelsToggleUsername(ctx context.Context, in *mtproto.TLChannelsToggleUsername) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsFragment) AccountReorderUsernames(ctx context.Context, in *mtproto.TLAccountReorderUsernames) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsFragment) AccountToggleUsername(ctx context.Context, in *mtproto.TLAccountToggleUsername) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++// vsGetViews — просмотры постов канала: уникальные зрители (redis set по общему номеру поста).
++func vsGetViews(ctx context.Context, in *mtproto.TLMessagesGetMessagesViews) (*mtproto.Messages_MessageViews, bool) {
++	md := vsMD(ctx)
++	chatId := in.GetPeer().GetChatId()
++	if chatId == 0 || vschan.Default.Kind(ctx, chatId) == 0 || len(in.GetId()) == 0 {
++		return nil, false
++	}
++	views := make([]*mtproto.MessageViews, len(in.GetId()))
++	for i := range views {
++		views[i] = mtproto.MakeTLMessageViews(&mtproto.MessageViews{}).To_MessageViews()
++	}
++	boxes, err := vsMessageCli.MessageGetUserMessageList(ctx, &messagepb.TLMessageGetUserMessageList{
++		UserId: md.UserId,
++		IdList: in.GetId(),
++	})
++	if err == nil && boxes != nil {
++		idx := map[int32]int{}
++		for i, id := range in.GetId() {
++			idx[id] = i
++		}
++		boxes.Walk(func(_ int, b *mtproto.MessageBox) {
++			i, ok := idx[b.GetMessageId()]
++			if !ok {
++				return
++			}
++			key := fmt.Sprintf("vs_views:%d:%d", chatId, b.GetDialogMessageId())
++			if mtproto.FromBool(in.GetIncrement()) {
++				_, _ = vsKV.Sadd(key, md.UserId)
++			}
++			n, _ := vsKV.Scard(key)
++			if n < 1 {
++				n = 1
++			}
++			views[i].Views = &wrapperspb.Int32Value{Value: int32(n)}
++		})
++	}
++	return mtproto.MakeTLMessagesMessageViews(&mtproto.Messages_MessageViews{
++		Views: views,
++		Chats: []*mtproto.Chat{},
++		Users: []*mtproto.User{},
++	}).To_Messages_MessageViews(), true
++}
+diff --git a/app/bff/bff/internal/server/vs_reactions.go b/app/bff/bff/internal/server/vs_reactions.go
+new file mode 100644
+index 0000000..be220cd
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_reactions.go
+@@ -0,0 +1,284 @@
++// VSети: реакции на сообщения (свой набор значков — vs_reactions_data.go).
++// Хранение: redis-хэш vs_react:{dialog1}:{dialog2}:{dialog_message_id} поле=userId значение=эмодзи.
++package server
++
++import (
++	"context"
++	"fmt"
++	"sort"
++	"strconv"
++	"time"
++
++	"github.com/teamgram/proto/mtproto"
++	sync_client "github.com/teamgram/teamgram-server/app/messenger/sync/client"
++	syncpb "github.com/teamgram/teamgram-server/app/messenger/sync/sync"
++	chatpb "github.com/teamgram/teamgram-server/app/service/biz/chat/chat"
++	messagepb "github.com/teamgram/teamgram-server/app/service/biz/message/message"
++
++	"github.com/zeromicro/go-zero/core/logx"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++var vsSyncCli sync_client.SyncClient
++
++type vsReactions struct {
++	mtproto.UnimplementedRPCReactionsServer
++}
++
++var vsKindNames = [7]string{"static.webp", "appear.tgs", "select.tgs", "activate.tgs", "effect.tgs", "around.tgs", "center.tgs"}
++
++func vsReactDocument(d vsReactDoc, alt string, kind int) *mtproto.Document {
++	stype := mtproto.TLConstructor_CRC32_storage_fileUnknown
++	if d.mime == "image/webp" {
++		stype = mtproto.TLConstructor_CRC32_storage_fileWebp
++	}
++	attrs := []*mtproto.DocumentAttribute{
++		mtproto.MakeTLDocumentAttributeImageSize(&mtproto.DocumentAttribute{W: d.wh, H: d.wh}).To_DocumentAttribute(),
++		mtproto.MakeTLDocumentAttributeSticker(&mtproto.DocumentAttribute{
++			Alt:        alt,
++			Stickerset: mtproto.MakeTLInputStickerSetEmpty(nil).To_InputStickerSet(),
++		}).To_DocumentAttribute(),
++		mtproto.MakeTLDocumentAttributeFilename(&mtproto.DocumentAttribute{FileName: vsKindNames[kind]}).To_DocumentAttribute(),
++	}
++	return mtproto.MakeTLDocument(&mtproto.Document{
++		Id:            d.id,
++		AccessHash:    int64(stype)<<32 | (d.id & 0xffffffff),
++		FileReference: []byte{},
++		Date:          1794400000,
++		MimeType:      d.mime,
++		Size2_INT64:   d.size,
++		Size2_INT32:   int32(d.size),
++		Size2:         d.size,
++		Thumbs:        []*mtproto.PhotoSize{},
++		VideoThumbs:   []*mtproto.VideoSize{},
++		DcId:          1,
++		Attributes:    attrs,
++	}).To_Document()
++}
++
++var vsReactAllowed = func() map[string]bool {
++	m := map[string]bool{}
++	for _, d := range vsReactDefs {
++		m[d.emoticon] = true
++	}
++	return m
++}()
++
++func (vsReactions) MessagesGetAvailableReactions(ctx context.Context, in *mtproto.TLMessagesGetAvailableReactions) (*mtproto.Messages_AvailableReactions, error) {
++	const hash = int32(0x56530001)
++	if in.GetHash() == hash {
++		return mtproto.MakeTLMessagesAvailableReactionsNotModified(nil).To_Messages_AvailableReactions(), nil
++	}
++	list := make([]*mtproto.AvailableReaction, 0, len(vsReactDefs))
++	for _, d := range vsReactDefs {
++		list = append(list, mtproto.MakeTLAvailableReaction(&mtproto.AvailableReaction{
++			Reaction:          d.emoticon,
++			Title:             d.title,
++			StaticIcon:        vsReactDocument(d.docs[0], d.emoticon, 0),
++			AppearAnimation:   vsReactDocument(d.docs[1], d.emoticon, 1),
++			SelectAnimation:   vsReactDocument(d.docs[2], d.emoticon, 2),
++			ActivateAnimation: vsReactDocument(d.docs[3], d.emoticon, 3),
++			EffectAnimation:   vsReactDocument(d.docs[4], d.emoticon, 4),
++			AroundAnimation:   vsReactDocument(d.docs[5], d.emoticon, 5),
++			CenterIcon:        vsReactDocument(d.docs[6], d.emoticon, 6),
++		}).To_AvailableReaction())
++	}
++	return mtproto.MakeTLMessagesAvailableReactions(&mtproto.Messages_AvailableReactions{
++		Hash:      hash,
++		Reactions: list,
++	}).To_Messages_AvailableReactions(), nil
++}
++
++func vsEmojiReactions(n int) []*mtproto.Reaction {
++	r := []*mtproto.Reaction{}
++	for i, d := range vsReactDefs {
++		if i >= n {
++			break
++		}
++		r = append(r, mtproto.MakeTLReactionEmoji(&mtproto.Reaction{Emoticon: d.emoticon}).To_Reaction())
++	}
++	return r
++}
++
++func (vsReactions) MessagesGetTopReactions(ctx context.Context, in *mtproto.TLMessagesGetTopReactions) (*mtproto.Messages_Reactions, error) {
++	return mtproto.MakeTLMessagesReactions(&mtproto.Messages_Reactions{Hash: 0x5653, Reactions: vsEmojiReactions(12)}).To_Messages_Reactions(), nil
++}
++
++func (vsReactions) MessagesGetRecentReactions(ctx context.Context, in *mtproto.TLMessagesGetRecentReactions) (*mtproto.Messages_Reactions, error) {
++	return mtproto.MakeTLMessagesReactions(&mtproto.Messages_Reactions{Hash: 0x5653, Reactions: vsEmojiReactions(8)}).To_Messages_Reactions(), nil
++}
++
++func (vsReactions) MessagesClearRecentReactions(ctx context.Context, in *mtproto.TLMessagesClearRecentReactions) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsReactions) MessagesSetDefaultReaction(ctx context.Context, in *mtproto.TLMessagesSetDefaultReaction) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsReactions) MessagesReportReaction(ctx context.Context, in *mtproto.TLMessagesReportReaction) (*mtproto.Bool, error) {
++	return mtproto.BoolTrue, nil
++}
++
++func (vsReactions) MessagesGetUnreadReactions(ctx context.Context, in *mtproto.TLMessagesGetUnreadReactions) (*mtproto.Messages_Messages, error) {
++	return mtproto.MakeTLMessagesMessages(&mtproto.Messages_Messages{
++		Messages: []*mtproto.Message{}, Chats: []*mtproto.Chat{}, Users: []*mtproto.User{}, Topics: []*mtproto.ForumTopic{},
++	}).To_Messages_Messages(), nil
++}
++
++func (vsReactions) MessagesReadReactions(ctx context.Context, in *mtproto.TLMessagesReadReactions) (*mtproto.Messages_AffectedHistory, error) {
++	return mtproto.MakeTLMessagesAffectedHistory(&mtproto.Messages_AffectedHistory{Pts: 0, PtsCount: 0, Offset: 0}).To_Messages_AffectedHistory(), nil
++}
++
++func (vsReactions) MessagesSetChatAvailableReactions(ctx context.Context, in *mtproto.TLMessagesSetChatAvailableReactions) (*mtproto.Updates, error) {
++	return mtproto.MakeTLUpdates(&mtproto.Updates{Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{}, Date: int32(time.Now().Unix())}).To_Updates(), nil
++}
++
++func (vsReactions) MessagesGetMessageReactionsList(ctx context.Context, in *mtproto.TLMessagesGetMessageReactionsList) (*mtproto.Messages_MessageReactionsList, error) {
++	return mtproto.MakeTLMessagesMessageReactionsList(&mtproto.Messages_MessageReactionsList{
++		Count: 0, Reactions: []*mtproto.MessagePeerReaction{}, Chats: []*mtproto.Chat{}, Users: []*mtproto.User{},
++	}).To_Messages_MessageReactionsList(), nil
++}
++
++func vsReactKey(b *mtproto.MessageBox) string {
++	return fmt.Sprintf("vs_react:%d:%d:%d", b.GetDialogId1(), b.GetDialogId2(), b.GetDialogMessageId())
++}
++
++// vsBuildReactions — счётчики для конкретного зрителя (chosen — его реакция).
++func vsBuildReactions(all map[string]string, viewer int64) *mtproto.MessageReactions {
++	counts := map[string]int32{}
++	for _, e := range all {
++		counts[e]++
++	}
++	mine := all[strconv.FormatInt(viewer, 10)]
++	keys := make([]string, 0, len(counts))
++	for k := range counts {
++		keys = append(keys, k)
++	}
++	sort.Slice(keys, func(i, j int) bool {
++		if counts[keys[i]] != counts[keys[j]] {
++			return counts[keys[i]] > counts[keys[j]]
++		}
++		return keys[i] < keys[j]
++	})
++	res := make([]*mtproto.ReactionCount, 0, len(keys))
++	for _, k := range keys {
++		rc := &mtproto.ReactionCount{
++			Reaction_REACTION: mtproto.MakeTLReactionEmoji(&mtproto.Reaction{Emoticon: k}).To_Reaction(),
++			Count:             counts[k],
++		}
++		if k == mine {
++			rc.ChosenOrder = wrapperspb.Int32(0)
++			rc.Chosen = true
++		}
++		res = append(res, mtproto.MakeTLReactionCount(rc).To_ReactionCount())
++	}
++	return mtproto.MakeTLMessageReactions(&mtproto.MessageReactions{
++		Results:         res,
++		RecentReactions: []*mtproto.MessagePeerReaction{},
++		TopReactors:     []*mtproto.MessageReactor{},
++	}).To_MessageReactions()
++}
++
++func vsUpdateReactions(peer *mtproto.Peer, msgId int32, r *mtproto.MessageReactions) *mtproto.Update {
++	return mtproto.MakeTLUpdateMessageReactions(&mtproto.Update{
++		Peer_PEER:                  peer,
++		MsgId_INT32:                msgId,
++		Reactions_MESSAGEREACTIONS: r,
++	}).To_Update()
++}
++
++// vsBoxPeer — собеседник/чат с точки зрения владельца ящика.
++func vsBoxPeer(b *mtproto.MessageBox) *mtproto.Peer {
++	if b.GetPeerType() == mtproto.PEER_CHAT {
++		return mtproto.MakePeerChat(b.GetPeerId())
++	}
++	return mtproto.MakePeerUser(b.GetPeerId())
++}
++
++func (vsReactions) MessagesSendReaction(ctx context.Context, in *mtproto.TLMessagesSendReaction) (*mtproto.Updates, error) {
++	md := vsMD(ctx)
++	boxes, err := vsMessageCli.MessageGetUserMessageList(ctx, &messagepb.TLMessageGetUserMessageList{
++		UserId: md.UserId, IdList: []int32{in.GetMsgId()},
++	})
++	if err != nil || boxes == nil || len(boxes.GetDatas()) == 0 {
++		return nil, mtproto.ErrMsgIdInvalid
++	}
++	box := boxes.GetDatas()[0]
++	key := vsReactKey(box)
++	field := strconv.FormatInt(md.UserId, 10)
++
++	emo := ""
++	if rl := in.GetReaction_FLAGVECTORREACTION(); len(rl) > 0 {
++		emo = rl[len(rl)-1].GetEmoticon()
++	} else if s := in.GetReaction_FLAGSTRING(); s != nil {
++		emo = s.GetValue()
++	}
++	if emo != "" && !vsReactAllowed[emo] {
++		return nil, mtproto.ErrReactionInvalid
++	}
++	if emo == "" {
++		_, _ = vsKV.Hdel(key, field)
++	} else if err := vsKV.Hset(key, field, emo); err != nil {
++		logx.WithContext(ctx).Errorf("sendReaction - redis: %v", err)
++		return nil, mtproto.ErrInternalServerError
++	}
++	all, _ := vsKV.Hgetall(key)
++
++	// разослать остальным участникам (у каждого свой номер сообщения)
++	var users []int64
++	if box.GetPeerType() == mtproto.PEER_CHAT {
++		if chat, err := vsChatCli.ChatGetMutableChat(ctx, &chatpb.TLChatGetMutableChat{ChatId: box.GetPeerId()}); err == nil {
++			chat.Walk(func(uid int64, p *mtproto.ImmutableChatParticipant) error {
++				if uid != md.UserId && p.IsChatMemberStateNormal() {
++					users = append(users, uid)
++				}
++				return nil
++			})
++		}
++	} else if box.GetPeerType() == mtproto.PEER_USER && box.GetPeerId() != md.UserId {
++		users = []int64{box.GetPeerId()}
++	}
++	if len(users) > 0 && vsSyncCli != nil {
++		others, _ := vsMessageCli.MessageGetUserMessageListByDataIdUserIdList(ctx, &messagepb.TLMessageGetUserMessageListByDataIdUserIdList{
++			Id: box.GetDialogMessageId(), UserIdList: users,
++		})
++		for _, ob := range others.GetDatas() {
++			if ob.GetDialogId1() != box.GetDialogId1() || ob.GetDialogId2() != box.GetDialogId2() {
++				continue
++			}
++			_, _ = vsSyncCli.SyncPushUpdates(ctx, &syncpb.TLSyncPushUpdates{
++				UserId: ob.GetUserId(),
++				Updates: mtproto.MakeTLUpdates(&mtproto.Updates{
++					Updates: []*mtproto.Update{vsUpdateReactions(vsBoxPeer(ob), ob.GetMessageId(), vsBuildReactions(all, ob.GetUserId()))},
++					Users:   []*mtproto.User{}, Chats: []*mtproto.Chat{}, Date: int32(time.Now().Unix()),
++				}).To_Updates(),
++			})
++		}
++	}
++	return mtproto.MakeTLUpdates(&mtproto.Updates{
++		Updates: []*mtproto.Update{vsUpdateReactions(vsBoxPeer(box), box.GetMessageId(), vsBuildReactions(all, md.UserId))},
++		Users:   []*mtproto.User{}, Chats: []*mtproto.Chat{}, Date: int32(time.Now().Unix()),
++	}).To_Updates(), nil
++}
++
++func (vsReactions) MessagesGetMessagesReactions(ctx context.Context, in *mtproto.TLMessagesGetMessagesReactions) (*mtproto.Updates, error) {
++	md := vsMD(ctx)
++	upd := mtproto.MakeTLUpdates(&mtproto.Updates{
++		Updates: []*mtproto.Update{}, Users: []*mtproto.User{}, Chats: []*mtproto.Chat{}, Date: int32(time.Now().Unix()),
++	}).To_Updates()
++	if len(in.GetId()) == 0 {
++		return upd, nil
++	}
++	boxes, err := vsMessageCli.MessageGetUserMessageList(ctx, &messagepb.TLMessageGetUserMessageList{
++		UserId: md.UserId, IdList: in.GetId(),
++	})
++	if err != nil || boxes == nil {
++		return upd, nil
++	}
++	for _, b := range boxes.GetDatas() {
++		all, _ := vsKV.Hgetall(vsReactKey(b))
++		upd.Updates = append(upd.Updates, vsUpdateReactions(vsBoxPeer(b), b.GetMessageId(), vsBuildReactions(all, md.UserId)))
++	}
++	return upd, nil
++}
+diff --git a/app/bff/bff/internal/server/vs_reactions_data.go b/app/bff/bff/internal/server/vs_reactions_data.go
+new file mode 100644
+index 0000000..777ea58
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_reactions_data.go
+@@ -0,0 +1,50 @@
++// Код сгенерирован из /home/claude/nm/react/gen.py — набор реакций VSети (Fluent Emoji 3D, MIT).
++package server
++
++type vsReactDoc struct {
++	id   int64
++	mime string
++	size int64
++	wh   int32
++}
++
++type vsReactDef struct {
++	emoticon string
++	title    string
++	docs     [7]vsReactDoc // static, appear, select, activate, effect, around, center
++}
++
++const vsReactIdBase = int64(0x5653000000000000)
++
++var vsReactDefs = []vsReactDef{
++	{"👍", "Нравится", [7]vsReactDoc{{vsReactIdBase + 16, "image/webp", 2956, 100}, {vsReactIdBase + 17, "application/x-tgsticker", 19748, 512}, {vsReactIdBase + 18, "application/x-tgsticker", 35544, 512}, {vsReactIdBase + 19, "application/x-tgsticker", 35547, 512}, {vsReactIdBase + 20, "application/x-tgsticker", 35547, 512}, {vsReactIdBase + 21, "application/x-tgsticker", 19748, 512}, {vsReactIdBase + 22, "application/x-tgsticker", 19658, 512}}},
++	{"👎", "Не нравится", [7]vsReactDoc{{vsReactIdBase + 32, "image/webp", 3010, 100}, {vsReactIdBase + 33, "application/x-tgsticker", 18944, 512}, {vsReactIdBase + 34, "application/x-tgsticker", 33647, 512}, {vsReactIdBase + 35, "application/x-tgsticker", 33652, 512}, {vsReactIdBase + 36, "application/x-tgsticker", 33652, 512}, {vsReactIdBase + 37, "application/x-tgsticker", 18944, 512}, {vsReactIdBase + 38, "application/x-tgsticker", 18858, 512}}},
++	{"❤", "Сердце", [7]vsReactDoc{{vsReactIdBase + 48, "image/webp", 3018, 100}, {vsReactIdBase + 49, "application/x-tgsticker", 19779, 512}, {vsReactIdBase + 50, "application/x-tgsticker", 33665, 512}, {vsReactIdBase + 51, "application/x-tgsticker", 33671, 512}, {vsReactIdBase + 52, "application/x-tgsticker", 33671, 512}, {vsReactIdBase + 53, "application/x-tgsticker", 19779, 512}, {vsReactIdBase + 54, "application/x-tgsticker", 19692, 512}}},
++	{"🔥", "Огонь", [7]vsReactDoc{{vsReactIdBase + 64, "image/webp", 3058, 100}, {vsReactIdBase + 65, "application/x-tgsticker", 19145, 512}, {vsReactIdBase + 66, "application/x-tgsticker", 34192, 512}, {vsReactIdBase + 67, "application/x-tgsticker", 34198, 512}, {vsReactIdBase + 68, "application/x-tgsticker", 34198, 512}, {vsReactIdBase + 69, "application/x-tgsticker", 19145, 512}, {vsReactIdBase + 70, "application/x-tgsticker", 19060, 512}}},
++	{"🥰", "Влюблён", [7]vsReactDoc{{vsReactIdBase + 80, "image/webp", 4596, 100}, {vsReactIdBase + 81, "application/x-tgsticker", 32706, 512}, {vsReactIdBase + 82, "application/x-tgsticker", 58713, 512}, {vsReactIdBase + 83, "application/x-tgsticker", 58717, 512}, {vsReactIdBase + 84, "application/x-tgsticker", 58717, 512}, {vsReactIdBase + 85, "application/x-tgsticker", 32706, 512}, {vsReactIdBase + 86, "application/x-tgsticker", 32621, 512}}},
++	{"👏", "Аплодисменты", [7]vsReactDoc{{vsReactIdBase + 96, "image/webp", 3858, 100}, {vsReactIdBase + 97, "application/x-tgsticker", 23133, 512}, {vsReactIdBase + 98, "application/x-tgsticker", 41537, 512}, {vsReactIdBase + 99, "application/x-tgsticker", 41544, 512}, {vsReactIdBase + 100, "application/x-tgsticker", 41544, 512}, {vsReactIdBase + 101, "application/x-tgsticker", 23133, 512}, {vsReactIdBase + 102, "application/x-tgsticker", 23042, 512}}},
++	{"😁", "Улыбка", [7]vsReactDoc{{vsReactIdBase + 112, "image/webp", 3678, 100}, {vsReactIdBase + 113, "application/x-tgsticker", 26938, 512}, {vsReactIdBase + 114, "application/x-tgsticker", 47522, 512}, {vsReactIdBase + 115, "application/x-tgsticker", 47525, 512}, {vsReactIdBase + 116, "application/x-tgsticker", 47525, 512}, {vsReactIdBase + 117, "application/x-tgsticker", 26938, 512}, {vsReactIdBase + 118, "application/x-tgsticker", 26847, 512}}},
++	{"🤔", "Задумался", [7]vsReactDoc{{vsReactIdBase + 128, "image/webp", 4430, 100}, {vsReactIdBase + 129, "application/x-tgsticker", 31178, 512}, {vsReactIdBase + 130, "application/x-tgsticker", 56104, 512}, {vsReactIdBase + 131, "application/x-tgsticker", 56107, 512}, {vsReactIdBase + 132, "application/x-tgsticker", 56107, 512}, {vsReactIdBase + 133, "application/x-tgsticker", 31178, 512}, {vsReactIdBase + 134, "application/x-tgsticker", 31096, 512}}},
++	{"🤯", "Взрыв мозга", [7]vsReactDoc{{vsReactIdBase + 144, "image/webp", 4668, 100}, {vsReactIdBase + 145, "application/x-tgsticker", 33127, 512}, {vsReactIdBase + 146, "application/x-tgsticker", 60333, 512}, {vsReactIdBase + 147, "application/x-tgsticker", 60337, 512}, {vsReactIdBase + 148, "application/x-tgsticker", 60337, 512}, {vsReactIdBase + 149, "application/x-tgsticker", 33127, 512}, {vsReactIdBase + 150, "application/x-tgsticker", 33041, 512}}},
++	{"😱", "Шок", [7]vsReactDoc{{vsReactIdBase + 160, "image/webp", 4270, 100}, {vsReactIdBase + 161, "application/x-tgsticker", 30891, 512}, {vsReactIdBase + 162, "application/x-tgsticker", 56261, 512}, {vsReactIdBase + 163, "application/x-tgsticker", 56268, 512}, {vsReactIdBase + 164, "application/x-tgsticker", 56268, 512}, {vsReactIdBase + 165, "application/x-tgsticker", 30891, 512}, {vsReactIdBase + 166, "application/x-tgsticker", 30812, 512}}},
++	{"🤬", "Злость", [7]vsReactDoc{{vsReactIdBase + 176, "image/webp", 4286, 100}, {vsReactIdBase + 177, "application/x-tgsticker", 29536, 512}, {vsReactIdBase + 178, "application/x-tgsticker", 52026, 512}, {vsReactIdBase + 179, "application/x-tgsticker", 52031, 512}, {vsReactIdBase + 180, "application/x-tgsticker", 52031, 512}, {vsReactIdBase + 181, "application/x-tgsticker", 29536, 512}, {vsReactIdBase + 182, "application/x-tgsticker", 29466, 512}}},
++	{"😢", "Грусть", [7]vsReactDoc{{vsReactIdBase + 192, "image/webp", 4130, 100}, {vsReactIdBase + 193, "application/x-tgsticker", 29696, 512}, {vsReactIdBase + 194, "application/x-tgsticker", 52569, 512}, {vsReactIdBase + 195, "application/x-tgsticker", 52571, 512}, {vsReactIdBase + 196, "application/x-tgsticker", 52571, 512}, {vsReactIdBase + 197, "application/x-tgsticker", 29696, 512}, {vsReactIdBase + 198, "application/x-tgsticker", 29624, 512}}},
++	{"🎉", "Праздник", [7]vsReactDoc{{vsReactIdBase + 208, "image/webp", 5966, 100}, {vsReactIdBase + 209, "application/x-tgsticker", 27687, 512}, {vsReactIdBase + 210, "application/x-tgsticker", 50467, 512}, {vsReactIdBase + 211, "application/x-tgsticker", 50471, 512}, {vsReactIdBase + 212, "application/x-tgsticker", 50471, 512}, {vsReactIdBase + 213, "application/x-tgsticker", 27687, 512}, {vsReactIdBase + 214, "application/x-tgsticker", 27592, 512}}},
++	{"🤩", "Восторг", [7]vsReactDoc{{vsReactIdBase + 224, "image/webp", 4266, 100}, {vsReactIdBase + 225, "application/x-tgsticker", 29440, 512}, {vsReactIdBase + 226, "application/x-tgsticker", 52310, 512}, {vsReactIdBase + 227, "application/x-tgsticker", 52314, 512}, {vsReactIdBase + 228, "application/x-tgsticker", 52314, 512}, {vsReactIdBase + 229, "application/x-tgsticker", 29440, 512}, {vsReactIdBase + 230, "application/x-tgsticker", 29368, 512}}},
++	{"🙏", "Спасибо", [7]vsReactDoc{{vsReactIdBase + 240, "image/webp", 2506, 100}, {vsReactIdBase + 241, "application/x-tgsticker", 15406, 512}, {vsReactIdBase + 242, "application/x-tgsticker", 27483, 512}, {vsReactIdBase + 243, "application/x-tgsticker", 27488, 512}, {vsReactIdBase + 244, "application/x-tgsticker", 27488, 512}, {vsReactIdBase + 245, "application/x-tgsticker", 15406, 512}, {vsReactIdBase + 246, "application/x-tgsticker", 15326, 512}}},
++	{"👌", "Окей", [7]vsReactDoc{{vsReactIdBase + 256, "image/webp", 3710, 100}, {vsReactIdBase + 257, "application/x-tgsticker", 20228, 512}, {vsReactIdBase + 258, "application/x-tgsticker", 36443, 512}, {vsReactIdBase + 259, "application/x-tgsticker", 36447, 512}, {vsReactIdBase + 260, "application/x-tgsticker", 36447, 512}, {vsReactIdBase + 261, "application/x-tgsticker", 20228, 512}, {vsReactIdBase + 262, "application/x-tgsticker", 20140, 512}}},
++	{"😍", "Обожаю", [7]vsReactDoc{{vsReactIdBase + 272, "image/webp", 3770, 100}, {vsReactIdBase + 273, "application/x-tgsticker", 29101, 512}, {vsReactIdBase + 274, "application/x-tgsticker", 52609, 512}, {vsReactIdBase + 275, "application/x-tgsticker", 52612, 512}, {vsReactIdBase + 276, "application/x-tgsticker", 52612, 512}, {vsReactIdBase + 277, "application/x-tgsticker", 29101, 512}, {vsReactIdBase + 278, "application/x-tgsticker", 29033, 512}}},
++	{"🤣", "Смешно", [7]vsReactDoc{{vsReactIdBase + 288, "image/webp", 4580, 100}, {vsReactIdBase + 289, "application/x-tgsticker", 31964, 512}, {vsReactIdBase + 290, "application/x-tgsticker", 57524, 512}, {vsReactIdBase + 291, "application/x-tgsticker", 57529, 512}, {vsReactIdBase + 292, "application/x-tgsticker", 57529, 512}, {vsReactIdBase + 293, "application/x-tgsticker", 31964, 512}, {vsReactIdBase + 294, "application/x-tgsticker", 31881, 512}}},
++	{"⚡", "Молния", [7]vsReactDoc{{vsReactIdBase + 304, "image/webp", 2006, 100}, {vsReactIdBase + 305, "application/x-tgsticker", 8383, 512}, {vsReactIdBase + 306, "application/x-tgsticker", 13926, 512}, {vsReactIdBase + 307, "application/x-tgsticker", 13928, 512}, {vsReactIdBase + 308, "application/x-tgsticker", 13928, 512}, {vsReactIdBase + 309, "application/x-tgsticker", 8383, 512}, {vsReactIdBase + 310, "application/x-tgsticker", 8295, 512}}},
++	{"🏆", "Кубок", [7]vsReactDoc{{vsReactIdBase + 320, "image/webp", 3630, 100}, {vsReactIdBase + 321, "application/x-tgsticker", 20287, 512}, {vsReactIdBase + 322, "application/x-tgsticker", 36099, 512}, {vsReactIdBase + 323, "application/x-tgsticker", 36104, 512}, {vsReactIdBase + 324, "application/x-tgsticker", 36104, 512}, {vsReactIdBase + 325, "application/x-tgsticker", 20287, 512}, {vsReactIdBase + 326, "application/x-tgsticker", 20196, 512}}},
++	{"💔", "Разбитое сердце", [7]vsReactDoc{{vsReactIdBase + 336, "image/webp", 3944, 100}, {vsReactIdBase + 337, "application/x-tgsticker", 20950, 512}, {vsReactIdBase + 338, "application/x-tgsticker", 35987, 512}, {vsReactIdBase + 339, "application/x-tgsticker", 35992, 512}, {vsReactIdBase + 340, "application/x-tgsticker", 35992, 512}, {vsReactIdBase + 341, "application/x-tgsticker", 20950, 512}, {vsReactIdBase + 342, "application/x-tgsticker", 20861, 512}}},
++	{"😭", "Плачу", [7]vsReactDoc{{vsReactIdBase + 352, "image/webp", 3694, 100}, {vsReactIdBase + 353, "application/x-tgsticker", 25523, 512}, {vsReactIdBase + 354, "application/x-tgsticker", 43484, 512}, {vsReactIdBase + 355, "application/x-tgsticker", 43489, 512}, {vsReactIdBase + 356, "application/x-tgsticker", 43489, 512}, {vsReactIdBase + 357, "application/x-tgsticker", 25523, 512}, {vsReactIdBase + 358, "application/x-tgsticker", 25427, 512}}},
++	{"👀", "Смотрю", [7]vsReactDoc{{vsReactIdBase + 368, "image/webp", 2958, 100}, {vsReactIdBase + 369, "application/x-tgsticker", 21844, 512}, {vsReactIdBase + 370, "application/x-tgsticker", 36192, 512}, {vsReactIdBase + 371, "application/x-tgsticker", 36197, 512}, {vsReactIdBase + 372, "application/x-tgsticker", 36197, 512}, {vsReactIdBase + 373, "application/x-tgsticker", 21844, 512}, {vsReactIdBase + 374, "application/x-tgsticker", 21756, 512}}},
++	{"😎", "Круто", [7]vsReactDoc{{vsReactIdBase + 384, "image/webp", 4178, 100}, {vsReactIdBase + 385, "application/x-tgsticker", 30739, 512}, {vsReactIdBase + 386, "application/x-tgsticker", 55075, 512}, {vsReactIdBase + 387, "application/x-tgsticker", 55081, 512}, {vsReactIdBase + 388, "application/x-tgsticker", 55081, 512}, {vsReactIdBase + 389, "application/x-tgsticker", 30739, 512}, {vsReactIdBase + 390, "application/x-tgsticker", 30659, 512}}},
++	{"💯", "Сто", [7]vsReactDoc{{vsReactIdBase + 400, "image/webp", 5812, 100}, {vsReactIdBase + 401, "application/x-tgsticker", 25706, 512}, {vsReactIdBase + 402, "application/x-tgsticker", 46345, 512}, {vsReactIdBase + 403, "application/x-tgsticker", 46350, 512}, {vsReactIdBase + 404, "application/x-tgsticker", 46350, 512}, {vsReactIdBase + 405, "application/x-tgsticker", 25706, 512}, {vsReactIdBase + 406, "application/x-tgsticker", 25611, 512}}},
++	{"🤝", "Рукопожатие", [7]vsReactDoc{{vsReactIdBase + 416, "image/webp", 3202, 100}, {vsReactIdBase + 417, "application/x-tgsticker", 24030, 512}, {vsReactIdBase + 418, "application/x-tgsticker", 42723, 512}, {vsReactIdBase + 419, "application/x-tgsticker", 42730, 512}, {vsReactIdBase + 420, "application/x-tgsticker", 42730, 512}, {vsReactIdBase + 421, "application/x-tgsticker", 24030, 512}, {vsReactIdBase + 422, "application/x-tgsticker", 23940, 512}}},
++	{"😘", "Поцелуй", [7]vsReactDoc{{vsReactIdBase + 432, "image/webp", 4200, 100}, {vsReactIdBase + 433, "application/x-tgsticker", 30658, 512}, {vsReactIdBase + 434, "application/x-tgsticker", 54909, 512}, {vsReactIdBase + 435, "application/x-tgsticker", 54913, 512}, {vsReactIdBase + 436, "application/x-tgsticker", 54913, 512}, {vsReactIdBase + 437, "application/x-tgsticker", 30658, 512}, {vsReactIdBase + 438, "application/x-tgsticker", 30580, 512}}},
++	{"🤗", "Обнимаю", [7]vsReactDoc{{vsReactIdBase + 448, "image/webp", 4328, 100}, {vsReactIdBase + 449, "application/x-tgsticker", 32767, 512}, {vsReactIdBase + 450, "application/x-tgsticker", 58943, 512}, {vsReactIdBase + 451, "application/x-tgsticker", 58949, 512}, {vsReactIdBase + 452, "application/x-tgsticker", 58949, 512}, {vsReactIdBase + 453, "application/x-tgsticker", 32767, 512}, {vsReactIdBase + 454, "application/x-tgsticker", 32682, 512}}},
++	{"🎄", "Ёлка", [7]vsReactDoc{{vsReactIdBase + 464, "image/webp", 3094, 100}, {vsReactIdBase + 465, "application/x-tgsticker", 17465, 512}, {vsReactIdBase + 466, "application/x-tgsticker", 32003, 512}, {vsReactIdBase + 467, "application/x-tgsticker", 32006, 512}, {vsReactIdBase + 468, "application/x-tgsticker", 32006, 512}, {vsReactIdBase + 469, "application/x-tgsticker", 17465, 512}, {vsReactIdBase + 470, "application/x-tgsticker", 17381, 512}}},
++	{"😇", "Ангел", [7]vsReactDoc{{vsReactIdBase + 480, "image/webp", 4286, 100}, {vsReactIdBase + 481, "application/x-tgsticker", 30757, 512}, {vsReactIdBase + 482, "application/x-tgsticker", 54801, 512}, {vsReactIdBase + 483, "application/x-tgsticker", 54805, 512}, {vsReactIdBase + 484, "application/x-tgsticker", 54805, 512}, {vsReactIdBase + 485, "application/x-tgsticker", 30757, 512}, {vsReactIdBase + 486, "application/x-tgsticker", 30676, 512}}},
++}
+diff --git a/app/bff/bff/internal/server/vs_webpage.go b/app/bff/bff/internal/server/vs_webpage.go
+new file mode 100644
+index 0000000..1ab2cb0
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_webpage.go
+@@ -0,0 +1,38 @@
++// VSети: предпросмотр ссылки, пока человек набирает сообщение.
++package server
++
++import (
++	"context"
++
++	"github.com/teamgram/proto/mtproto"
++	"github.com/teamgram/teamgram-server/pkg/vswebpage"
++	"mvdan.cc/xurls/v2"
++)
++
++type vsWebPage struct {
++	mtproto.UnimplementedRPCWebPageServer
++}
++
++func vsPreviewMedia(ctx context.Context, text string) *mtproto.MessageMedia {
++	u := xurls.Relaxed().FindString(text)
++	if u == "" {
++		return mtproto.MakeTLMessageMediaEmpty(nil).To_MessageMedia()
++	}
++	wp, err := vswebpage.Preview(ctx, u)
++	if err != nil || wp == nil {
++		return mtproto.MakeTLMessageMediaEmpty(nil).To_MessageMedia()
++	}
++	return mtproto.MakeTLMessageMediaWebPage(&mtproto.MessageMedia{Webpage: wp}).To_MessageMedia()
++}
++
++func (vsWebPage) MessagesGetWebPagePreview570D6F6F(ctx context.Context, in *mtproto.TLMessagesGetWebPagePreview570D6F6F) (*mtproto.Messages_WebPagePreview, error) {
++	return mtproto.MakeTLMessagesWebPagePreview(&mtproto.Messages_WebPagePreview{
++		Media: vsPreviewMedia(ctx, in.GetMessage()),
++		Chats: []*mtproto.Chat{},
++		Users: []*mtproto.User{},
++	}).To_Messages_WebPagePreview(), nil
++}
++
++func (vsWebPage) MessagesGetWebPagePreview8B68B0CC(ctx context.Context, in *mtproto.TLMessagesGetWebPagePreview8B68B0CC) (*mtproto.MessageMedia, error) {
++	return vsPreviewMedia(ctx, in.GetMessage()), nil
++}
+diff --git a/app/bff/chats/internal/core/messages.createChat_handler.go b/app/bff/chats/internal/core/messages.createChat_handler.go
+index 75e07fe..b0fb457 100644
+--- a/app/bff/chats/internal/core/messages.createChat_handler.go
++++ b/app/bff/chats/internal/core/messages.createChat_handler.go
+@@ -19,6 +19,7 @@
+ package core
+ 
+ import (
++	"strings"
+ 	"math/rand"
+ 	"time"
+ 
+@@ -45,12 +46,6 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
+ 		return nil, err
+ 	}
+ 
+-	if len(iUsers) == 0 {
+-		err := mtproto.ErrUsersTooFew
+-		c.Logger.Errorf("messages.createChat - error: %v", err)
+-		return nil, err
+-	}
+-
+ 	// check user too much
+ 	if len(iUsers) > 200-1 {
+ 		err := mtproto.ErrUsersTooMuch
+@@ -98,12 +93,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
+ 					UserId:  addUser.Id(),
+ 					KeyType: mtproto.CHAT_INVITE,
+ 				})
+-				if len(rules.Datas) == 0 {
+-					missingInvitees = append(missingInvitees, mtproto.MakeTLMissingInvitee(&mtproto.MissingInvitee{
+-						PremiumWouldAllowInvite: false,
+-						PremiumRequiredForPm:    false,
+-						UserId:                  u.UserId,
+-					}).To_MissingInvitee())
++				if rules == nil || len(rules.Datas) == 0 {
++					// VSети: правил нет = по умолчанию «Все» (как в Telegram) — приглашать можно
+ 				} else {
+ 					allowAddChat := mtproto.CheckPrivacyIsAllow(
+ 						addUser.Id(),
+@@ -130,11 +121,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
+ 		}
+ 	}
+ 
+-	if len(userAddList) == 0 {
+-		err := mtproto.ErrUsersTooFew
+-		c.Logger.Errorf("messages.createChat - error: %v", err)
+-		return nil, err
+-	}
++	// VSети: группу можно создать и без участников — пригласить потом
++	_ = missingInvitees
+ 
+ 	chat, err := c.svcCtx.Dao.ChatClient.Client().ChatCreateChat2(c.ctx, &chatpb.TLChatCreateChat2{
+ 		CreatorId:  c.MD.UserId,
+@@ -148,6 +136,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
+ 		return nil, err
+ 	}
+ 
++	// VSети: название без служебного префикса канала
++	vsShowTitle := strings.TrimPrefix(strings.TrimPrefix(chatTitle, mtproto.VsTitlePrefixBroadcast), mtproto.VsTitlePrefixMegagroup)
+ 	outMessages := []*msgpb.OutboxMessage{
+ 		msgpb.MakeTLOutboxMessage(&msgpb.OutboxMessage{
+ 			NoWebpage:  true,
+@@ -168,9 +158,9 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
+ 				ReplyTo:              nil,
+ 				Date:                 int32(time.Now().Unix()),
+ 				Action: mtproto.MakeTLMessageActionChatCreate(&mtproto.MessageAction{
+-					Title:            chatTitle,
+-					Title_FLAGSTRING: mtproto.MakeFlagsString(chatTitle),
+-					Title_STRING:     chatTitle,
++					Title:            vsShowTitle,
++					Title_FLAGSTRING: mtproto.MakeFlagsString(vsShowTitle),
++					Title_STRING:     vsShowTitle,
+ 					Users:            append(userAddList, botAddList...),
+ 				}).To_MessageAction(),
+ 				Reactions: nil,
+diff --git a/app/bff/updates/internal/core/updates.getChannelDifference_handler.go b/app/bff/updates/internal/core/updates.getChannelDifference_handler.go
+index 2bd6119..a3c3231 100644
+--- a/app/bff/updates/internal/core/updates.getChannelDifference_handler.go
++++ b/app/bff/updates/internal/core/updates.getChannelDifference_handler.go
+@@ -25,8 +25,15 @@ import (
+ // UpdatesGetChannelDifference
+ // updates.getChannelDifference#3173d78 flags:# force:flags.0?true channel:InputChannel filter:ChannelMessagesFilter pts:int limit:int = updates.ChannelDifference;
+ func (c *UpdatesCore) UpdatesGetChannelDifference(in *mtproto.TLUpdatesGetChannelDifference) (*mtproto.Updates_ChannelDifference, error) {
+-	// TODO: not impl
+-	c.Logger.Errorf("updates.getChannelDifference blocked, License key from https://teamgram.net required to unlock enterprise features.")
+-
+-	return nil, mtproto.ErrEnterpriseIsBlocked
++	// VSети: сообщения каналов приходят через общий pts пользователя (как в группах),
++	// поэтому разница по каналу всегда пустая — подтверждаем pts клиента.
++	pts := in.GetPts()
++	if pts < 1 {
++		pts = 1
++	}
++	return mtproto.MakeTLUpdatesChannelDifferenceEmpty(&mtproto.Updates_ChannelDifference{
++		Final:   true,
++		Pts:     pts,
++		Timeout: mtproto.MakeFlagsInt32(300),
++	}).To_Updates_ChannelDifference(), nil
+ }
+diff --git a/app/bff/usernames/internal/core/channels.checkUsername_handler.go b/app/bff/usernames/internal/core/channels.checkUsername_handler.go
+index 73ac84a..a1651e2 100644
+--- a/app/bff/usernames/internal/core/channels.checkUsername_handler.go
++++ b/app/bff/usernames/internal/core/channels.checkUsername_handler.go
+@@ -19,14 +19,45 @@
+ package core
+ 
+ import (
++	"github.com/teamgram/marmota/pkg/strings2"
++	"github.com/teamgram/marmota/pkg/utils"
+ 	"github.com/teamgram/proto/mtproto"
++	chatpb "github.com/teamgram/teamgram-server/app/service/biz/chat/chat"
++	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
+ )
+ 
+ // ChannelsCheckUsername
+ // channels.checkUsername#10e6bd2c channel:InputChannel username:string = Bool;
+ func (c *UsernamesCore) ChannelsCheckUsername(in *mtproto.TLChannelsCheckUsername) (*mtproto.Bool, error) {
+-	// TODO: not impl
+-	c.Logger.Errorf("channels.checkUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
++	if !vsUsernameValid(in.GetUsername()) {
++		return nil, mtproto.ErrUsernameInvalid
++	}
++	existed, err := c.svcCtx.Dao.UserClient.UserCheckChannelUsername(c.ctx, &user.TLUserCheckChannelUsername{
++		ChannelId: in.GetChannel().GetChannelId(),
++		Username:  in.GetUsername(),
++	})
++	if err != nil {
++		return nil, err
++	}
++	if existed.GetPredicateName() == user.Predicate_usernameExistedNotMe {
++		return mtproto.BoolFalse, nil
++	}
++	return mtproto.BoolTrue, nil
++}
++
++// VSети: канал = группа с признаком (см. pkg/vschan); имя хранится как PEER_CHANNEL.
++func (c *UsernamesCore) vsChannelForEdit(ch *mtproto.InputChannel) (*mtproto.MutableChat, error) {
++	chat, err := c.svcCtx.Dao.ChatClient.ChatGetMutableChat(c.ctx, &chatpb.TLChatGetMutableChat{ChatId: ch.GetChannelId()})
++	if err != nil || chat == nil || !chat.IsVsChannel() {
++		return nil, mtproto.ErrChannelInvalid
++	}
++	me, ok := chat.GetImmutableChatParticipant(c.MD.UserId)
++	if !ok || !(me.IsChatMemberCreator() || me.IsChatMemberAdmin()) {
++		return nil, mtproto.ErrChatAdminRequired
++	}
++	return chat, nil
++}
+ 
+-	return nil, mtproto.ErrEnterpriseIsBlocked
++func vsUsernameValid(u string) bool {
++	return len(u) >= user.MinUsernameLen && len(u) <= 32 && strings2.IsAlNumString(u) && !utils.IsNumber(u[0])
+ }
+diff --git a/app/bff/usernames/internal/core/channels.updateUsername_handler.go b/app/bff/usernames/internal/core/channels.updateUsername_handler.go
+index a822b0d..e598c6f 100644
+--- a/app/bff/usernames/internal/core/channels.updateUsername_handler.go
++++ b/app/bff/usernames/internal/core/channels.updateUsername_handler.go
+@@ -20,13 +20,39 @@ package core
+ 
+ import (
+ 	"github.com/teamgram/proto/mtproto"
++	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
+ )
+ 
+ // ChannelsUpdateUsername
+ // channels.updateUsername#3514b3de channel:InputChannel username:string = Bool;
+ func (c *UsernamesCore) ChannelsUpdateUsername(in *mtproto.TLChannelsUpdateUsername) (*mtproto.Bool, error) {
+-	// TODO: not impl
+-	c.Logger.Errorf("channels.updateUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
+-
+-	return nil, mtproto.ErrEnterpriseIsBlocked
++	chat, err := c.vsChannelForEdit(in.GetChannel())
++	if err != nil {
++		return nil, err
++	}
++	name := in.GetUsername()
++	if name != "" && !vsUsernameValid(name) {
++		return nil, mtproto.ErrUsernameInvalid
++	}
++	if name != "" {
++		if ok, _ := c.ChannelsCheckUsername(&mtproto.TLChannelsCheckUsername{Channel: in.GetChannel(), Username: name}); !mtproto.FromBool(ok) {
++			return nil, mtproto.ErrUsernameOccupied
++		}
++	}
++	_, _ = c.svcCtx.Dao.UserClient.UserDeleteUsernameByPeer(c.ctx, &user.TLUserDeleteUsernameByPeer{
++		PeerType: mtproto.PEER_CHANNEL, PeerId: chat.Id(),
++	})
++	if name != "" {
++		r, err := c.svcCtx.Dao.UserClient.UserUpdateUsernameByPeer(c.ctx, &user.TLUserUpdateUsernameByPeer{
++			PeerType: mtproto.PEER_CHANNEL, PeerId: chat.Id(), Username: name,
++		})
++		if err != nil {
++			return nil, err
++		}
++		if !mtproto.FromBool(r) {
++			return nil, mtproto.ErrUsernameOccupied
++		}
++	}
++	mtproto.VsForgetChannelUsername(chat.Id())
++	return mtproto.BoolTrue, nil
+ }
+diff --git a/app/bff/usernames/internal/core/contacts.resolveUsername_handler.go b/app/bff/usernames/internal/core/contacts.resolveUsername_handler.go
+index c865648..5a767ce 100644
+--- a/app/bff/usernames/internal/core/contacts.resolveUsername_handler.go
++++ b/app/bff/usernames/internal/core/contacts.resolveUsername_handler.go
+@@ -76,10 +76,9 @@ func (c *UsernamesCore) ContactsResolveUsername(in *mtproto.TLContactsResolveUse
+ 			resolvedPeer.Chats = []*mtproto.Chat{chat.ToUnsafeChat(c.MD.UserId)}
+ 		}
+ 	case mtproto.PEER_CHANNEL:
+-		if c.svcCtx.Plugin != nil {
+-			resolvedPeer.Chats = c.svcCtx.Plugin.GetChannelListByIdList(c.ctx, c.MD.UserId, peer.PeerId)
+-		} else {
+-			c.Logger.Errorf("contacts.resolveUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
++		// VSети: канал — это группа с признаком
++		if chat2, _ := c.svcCtx.Dao.ChatClient.ChatGetMutableChat(c.ctx, &chat.TLChatGetMutableChat{ChatId: peer.PeerId}); chat2 != nil {
++			resolvedPeer.Chats = []*mtproto.Chat{chat2.ToUnsafeChat(c.MD.UserId)}
+ 		}
+ 	}
+ 
+diff --git a/app/messenger/msg/internal/dao/fake_plugin.go b/app/messenger/msg/internal/dao/fake_plugin.go
+index b06d649..75476e6 100644
+--- a/app/messenger/msg/internal/dao/fake_plugin.go
++++ b/app/messenger/msg/internal/dao/fake_plugin.go
+@@ -7,6 +7,7 @@
+ package dao
+ 
+ import (
++	"github.com/teamgram/teamgram-server/pkg/vswebpage"
+ 	"context"
+ 
+ 	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
+@@ -23,5 +24,5 @@ func (d *Dao) UsernameResolveUsername(ctx context.Context, in *user.TLUserResolv
+ }
+ 
+ func (d *Dao) GetWebpagePreview(ctx context.Context, url string) (*mtproto.WebPage, error) {
+-	return nil, mtproto.ErrMethodNotImpl
++	return vswebpage.Preview(ctx, url) // VSети: свой предпросмотр ссылок (pkg/vswebpage)
+ }
+diff --git a/app/messenger/msg/msg/internal/core/msg.sendMessageV2_handler.go b/app/messenger/msg/msg/internal/core/msg.sendMessageV2_handler.go
+index 7b0c4af..bc30c6b 100644
+--- a/app/messenger/msg/msg/internal/core/msg.sendMessageV2_handler.go
++++ b/app/messenger/msg/msg/internal/core/msg.sendMessageV2_handler.go
+@@ -313,6 +313,12 @@ func (c *MsgCore) sendChatOutgoingMessageV2(fromUserId, fromAuthKeyId, peerChatI
+ 		err = mtproto.ErrChatWriteForbidden
+ 		return nil, err
+ 	}
++	// VSети: в канал пишут только владелец и админы
++	if chat.IsVsBroadcast() && outBox.GetMessage().GetPredicateName() != mtproto.Predicate_messageService {
++		if me, _ := chat.GetImmutableChatParticipant(fromUserId); me == nil || (!me.IsChatMemberCreator() && !me.IsChatMemberAdmin()) {
++			return nil, mtproto.ErrChatWriteForbidden
++		}
++	}
+ 
+ 	outBox.Message = plugin.RemakeMessage(
+ 		c.ctx,
+diff --git a/app/messenger/msg/msg/internal/svc/service_context.go b/app/messenger/msg/msg/internal/svc/service_context.go
+index 5a3493a..0564923 100644
+--- a/app/messenger/msg/msg/internal/svc/service_context.go
++++ b/app/messenger/msg/msg/internal/svc/service_context.go
+@@ -19,6 +19,7 @@
+ package svc
+ 
+ import (
++	"github.com/teamgram/teamgram-server/pkg/vswebpage"
+ 	kafka "github.com/teamgram/marmota/pkg/mq"
+ 	"github.com/teamgram/marmota/pkg/net/rpcx"
+ 	"github.com/teamgram/marmota/pkg/stores/kv"
+@@ -66,6 +67,8 @@ func NewServiceContext(c config.Config, plugin plugin.MsgPlugin) *ServiceContext
+ 	if plugin == nil {
+ 		svcCtx.MsgPlugin = svcCtx.Dao
+ 	}
++	// VSети: предпросмотр ссылок кладёт картинку через dfs (тот же etcd)
++	vswebpage.SetDfsEtcd(c.IdgenClient.Etcd.Hosts)
+ 
+ 	return svcCtx
+ }
+diff --git a/app/messenger/sync/internal/core/core.go b/app/messenger/sync/internal/core/core.go
+index e25cb2f..e55a532 100644
+--- a/app/messenger/sync/internal/core/core.go
++++ b/app/messenger/sync/internal/core/core.go
+@@ -10,6 +10,8 @@
+ package core
+ 
+ import (
++	"github.com/teamgram/teamgram-server/pkg/vschan"
++	"google.golang.org/protobuf/proto"
+ 	"context"
+ 
+ 	"github.com/teamgram/proto/mtproto"
+@@ -177,6 +179,11 @@ func (c *SyncCore) processUpdates(syncType SyncType, userId int64, isBot bool, u
+ }
+ 
+ func (c *SyncCore) pushUpdatesToSession(syncType SyncType, userId, permAuthKeyId int64, hasServerId *wrapperspb.StringValue, authKeyId, sessionId *wrapperspb.Int64Value, pushData *mtproto.Updates, notification bool) {
++	// VSети: каналы — peerChat → peerChannel для клиента (копия, чтобы не портить общий объект)
++	if vschan.Default != nil && pushData != nil {
++		pushData = proto.Clone(pushData).(*mtproto.Updates)
++		vschan.Default.RewriteOut(c.ctx, pushData)
++	}
+ 	if syncType == syncTypeUserMe && hasServerId != nil {
+ 		c.Logger.Debugf("pushUpdatesToSession - pushData: {server_id: %v, auth_key_id: %v}", hasServerId, authKeyId)
+ 		if sessionId != nil {
+diff --git a/app/messenger/sync/internal/svc/service_context.go b/app/messenger/sync/internal/svc/service_context.go
+index b7ed9cd..a1c77b1 100644
+--- a/app/messenger/sync/internal/svc/service_context.go
++++ b/app/messenger/sync/internal/svc/service_context.go
+@@ -10,6 +10,14 @@
+ package svc
+ 
+ import (
++	"github.com/teamgram/marmota/pkg/net/rpcx"
++	user_client "github.com/teamgram/teamgram-server/app/service/biz/user/client"
++	userpb "github.com/teamgram/teamgram-server/app/service/biz/user/user"
++	"context"
++
++	"github.com/teamgram/proto/mtproto"
++	chatpb "github.com/teamgram/teamgram-server/app/service/biz/chat/chat"
++	"github.com/teamgram/teamgram-server/pkg/vschan"
+ 	"github.com/teamgram/teamgram-server/app/messenger/sync/internal/config"
+ 	"github.com/teamgram/teamgram-server/app/messenger/sync/internal/dao"
+ )
+@@ -20,8 +28,25 @@ type ServiceContext struct {
+ }
+ 
+ func NewServiceContext(c config.Config) *ServiceContext {
++	d := dao.New(c)
++	// VSети: резолвер каналов для пушей
++	vschan.Default = vschan.NewResolver(func(ctx context.Context, chatId int64) int32 {
++		chat, err := d.ChatClient.ChatGetMutableChat(context.Background(), &chatpb.TLChatGetMutableChat{ChatId: chatId})
++		if err != nil || chat == nil {
++			return 0
++		}
++		return mtproto.VsKind(chat.GetChat().GetAvailableReactionsType())
++	})
++	vsUserCli := user_client.NewUserClient(rpcx.GetCachedRpcClient(c.ChatClient))
++	mtproto.VsSetChannelUsernameFetcher(func(id int64) string {
++		u, err := vsUserCli.UserGetChannelUsername(context.Background(), &userpb.TLUserGetChannelUsername{ChannelId: id})
++		if err != nil || u == nil {
++			return ""
++		}
++		return u.GetUsername()
++	})
+ 	return &ServiceContext{
+ 		Config: c,
+-		Dao:    dao.New(c),
++		Dao:    d,
+ 	}
+ }
+diff --git a/app/service/biz/chat/chat/chat_invite_helper.go b/app/service/biz/chat/chat/chat_invite_helper.go
+index 7763601..88639b4 100644
+--- a/app/service/biz/chat/chat/chat_invite_helper.go
++++ b/app/service/biz/chat/chat/chat_invite_helper.go
+@@ -81,6 +81,15 @@ func (m *ChatInviteExt) ToChatInvite(selfId int64, cb func(idList []int64) []*mt
+ 		if cb != nil {
+ 			chatInvite.Participants = cb(m.Participants)
+ 		}
++		// VSети: канал/супергруппа
++		if m.Chat != nil && m.Chat.IsVsChannel() {
++			chatInvite.Channel = true
++			chatInvite.Broadcast = m.Chat.IsVsBroadcast()
++			chatInvite.Megagroup = m.Chat.IsVsMegagroup()
++			if chatInvite.Broadcast {
++				chatInvite.Participants = []*mtproto.User{}
++			}
++		}
+ 		return chatInvite
+ 	case Predicate_chatInvitePeek:
+ 		return mtproto.MakeTLChatInvitePeek(&mtproto.ChatInvite{
+diff --git a/app/service/biz/chat/internal/core/chat.addChatUser_handler.go b/app/service/biz/chat/internal/core/chat.addChatUser_handler.go
+index 6529986..e1bea71 100644
+--- a/app/service/biz/chat/internal/core/chat.addChatUser_handler.go
++++ b/app/service/biz/chat/internal/core/chat.addChatUser_handler.go
+@@ -58,7 +58,7 @@ func (c *ChatCore) ChatAddChatUser(in *chat.TLChatAddChatUser) (*mtproto.Mutable
+ 		inviterId = chat2.Creator()
+ 	}
+ 
+-	if chat2.ParticipantsCount() >= 200 {
++	if !chat2.IsVsChannel() && chat2.ParticipantsCount() >= 200 { // VSети: у каналов без лимита 200
+ 		err = mtproto.ErrUsersTooFew
+ 		c.Logger.Errorf("chat.addChatUser - error: %v", err)
+ 		return nil, err
+diff --git a/app/service/biz/chat/internal/core/chat.checkChatInvite_handler.go b/app/service/biz/chat/internal/core/chat.checkChatInvite_handler.go
+index 52658bf..2032d9f 100644
+--- a/app/service/biz/chat/internal/core/chat.checkChatInvite_handler.go
++++ b/app/service/biz/chat/internal/core/chat.checkChatInvite_handler.go
+@@ -84,6 +84,7 @@ func (c *ChatCore) ChatCheckChatInvite(in *chat.TLChatCheckChatInvite) (*chat.Ch
+ 			Photo:             mChat.Photo(),
+ 			ParticipantsCount: mChat.Chat.ParticipantsCount,
+ 			Participants:      mChat.ParticipantIdList(),
++			Chat:              mChat, // VSети: чтобы отличать канал
+ 		}).To_ChatInviteExt()
+ 
+ 		return rValue, nil
+diff --git a/app/service/biz/chat/internal/core/chat.createChat2_handler.go b/app/service/biz/chat/internal/core/chat.createChat2_handler.go
+index a67b419..caa9381 100644
+--- a/app/service/biz/chat/internal/core/chat.createChat2_handler.go
++++ b/app/service/biz/chat/internal/core/chat.createChat2_handler.go
+@@ -10,6 +10,7 @@
+ package core
+ 
+ import (
++	"strings"
+ 	"math/rand"
+ 	"time"
+ 
+@@ -29,7 +30,14 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
+ 		creatorId  = in.CreatorId
+ 		userIdList = in.UserIdList
+ 		title      = in.Title
++		vsKind     int32
+ 	)
++	// VSети: канал/супергруппа — по префиксу названия от bff channels.createChannel
++	if strings.HasPrefix(title, mtproto.VsTitlePrefixBroadcast) {
++		vsKind, title = mtproto.VsKindBroadcast, strings.TrimPrefix(title, mtproto.VsTitlePrefixBroadcast)
++	} else if strings.HasPrefix(title, mtproto.VsTitlePrefixMegagroup) {
++		vsKind, title = mtproto.VsKindMegagroup, strings.TrimPrefix(title, mtproto.VsTitlePrefixMegagroup)
++	}
+ 
+ 	// TODO:
+ 	if chatsDO, err = c.svcCtx.Dao.ChatsDAO.SelectLastCreator(c.ctx, creatorId); err != nil {
+@@ -55,7 +63,7 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
+ 		DefaultBannedRights:    int64(mtproto.MakeDefaultBannedRights().ToBannedRights()),
+ 		MigratedToId:           0,
+ 		MigratedToAccessHash:   0,
+-		AvailableReactionsType: 0,
++		AvailableReactionsType: vsKind,
+ 		AvailableReactions:     "",
+ 		Deactivated:            false,
+ 		Noforwards:             false,
+@@ -108,6 +116,12 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
+ 			result.Err = err
+ 			return
+ 		}
++		// VSети: вид канала (insert не пишет available_reactions_type)
++		if vsKind > 0 {
++			if _, result.Err = tx.Exec("update chats set available_reactions_type = ? where id = ?", vsKind, chatsDO.Id); result.Err != nil {
++				return
++			}
++		}
+ 		//chatsDO.Id = chatId
+ 		for i := 0; i < len(participantDOList); i++ {
+ 			participantDOList[i].ChatId = chatsDO.Id
+diff --git a/app/service/biz/chat/internal/core/chat.importChatInvite2_handler.go b/app/service/biz/chat/internal/core/chat.importChatInvite2_handler.go
+index 9f85463..a3e6e09 100644
+--- a/app/service/biz/chat/internal/core/chat.importChatInvite2_handler.go
++++ b/app/service/biz/chat/internal/core/chat.importChatInvite2_handler.go
+@@ -71,7 +71,7 @@ func (c *ChatCore) ChatImportChatInvite2(in *chat.TLChatImportChatInvite2) (*cha
+ 			return nil, err2
+ 		}
+ 
+-		if mChat.ParticipantsCount() >= 200 {
++		if !mChat.IsVsChannel() && mChat.ParticipantsCount() >= 200 { // VSети: у каналов без лимита 200
+ 			err2 = mtproto.ErrUsersTooMuch
+ 			c.Logger.Errorf("chat.importChatInvite - error: %v", err2)
+ 			return nil, err2
+diff --git a/app/service/dfs/internal/minio_util/minio.go b/app/service/dfs/internal/minio_util/minio.go
+index 7ce8472..5f10fdc 100644
+--- a/app/service/dfs/internal/minio_util/minio.go
++++ b/app/service/dfs/internal/minio_util/minio.go
+@@ -82,6 +82,8 @@ func s3PutOptions(encrypted bool, contentType string) minio.PutObjectOptions {
+ 		options.ServerSideEncryption = encrypt.NewSSE()
+ 	}
+ 	options.ContentType = contentType
++	// VSети: новый SeaweedFS не принимает CRC32C-проверку частей от minio-go (Content-Md5 mismatch) — шлём MD5
++	options.SendContentMd5 = true
+ 
+ 	return options
+ }
+diff --git a/go.mod b/go.mod
+index 6593d21..e36bcaa 100644
+--- a/go.mod
++++ b/go.mod
+@@ -147,3 +147,4 @@ require (
+ // github.com/teamgram/marmota => ../marmota
+ // github.com/teamgram/proto => ../proto
+ replace github.com/panjf2000/gnet/v2 v2.9.1 => github.com/teamgram/gnet/v2 v2.9.1-teamgram
++replace github.com/teamgram/proto => ../tgproto
+diff --git a/pkg/vschan/vschan.go b/pkg/vschan/vschan.go
+new file mode 100644
+index 0000000..bc3bfa0
+--- /dev/null
++++ b/pkg/vschan/vschan.go
+@@ -0,0 +1,244 @@
++// Package vschan — VSети: каналы и супергруппы поверх обычных групп Teamgram.
++//
++// Внутри сервера канал хранится как обычная группа (PEER_CHAT, таблица chats,
++// available_reactions_type >= 100). На границе с клиентом:
++//   - в ответах и пушах peerChat(id канала) → peerChannel, messageActionChatCreate →
++//     messageActionChannelCreate, посты в канале (broadcast) → post=true без from_id;
++//   - в запросах inputPeerChannel → inputPeerChat, peerChannel → peerChat.
++package vschan
++
++import (
++	"context"
++	"sync"
++	"time"
++
++	"github.com/teamgram/proto/mtproto"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/reflect/protoreflect"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++// Kind: 0 — обычная группа, mtproto.VsKindMegagroup, mtproto.VsKindBroadcast.
++type KindFunc func(ctx context.Context, chatId int64) int32
++
++type cacheItem struct {
++	kind int32
++	at   time.Time
++}
++
++// Resolver кэширует вид чата (вид канала не меняется никогда).
++type Resolver struct {
++	mu    sync.RWMutex
++	m     map[int64]cacheItem
++	fetch KindFunc
++}
++
++func NewResolver(fetch KindFunc) *Resolver {
++	return &Resolver{m: make(map[int64]cacheItem), fetch: fetch}
++}
++
++func (r *Resolver) Kind(ctx context.Context, chatId int64) int32 {
++	if r == nil || chatId == 0 {
++		return 0
++	}
++	r.mu.RLock()
++	it, ok := r.m[chatId]
++	r.mu.RUnlock()
++	if ok && (it.kind > 0 || time.Since(it.at) < 2*time.Minute) {
++		return it.kind
++	}
++	k := r.fetch(ctx, chatId)
++	r.mu.Lock()
++	r.m[chatId] = cacheItem{kind: k, at: time.Now()}
++	r.mu.Unlock()
++	return k
++}
++
++// Remember — сразу после создания канала, чтобы не ждать кэш.
++func (r *Resolver) Remember(chatId int64, kind int32) {
++	if r == nil {
++		return
++	}
++	r.mu.Lock()
++	r.m[chatId] = cacheItem{kind: kind, at: time.Now()}
++	r.mu.Unlock()
++}
++
++var (
++	peerDesc      = (&mtproto.Peer{}).ProtoReflect().Descriptor()
++	inputPeerDesc = (&mtproto.InputPeer{}).ProtoReflect().Descriptor()
++	messageDesc   = (&mtproto.Message{}).ProtoReflect().Descriptor()
++	actionDesc    = (&mtproto.MessageAction{}).ProtoReflect().Descriptor()
++	dialogDesc    = (&mtproto.Dialog{}).ProtoReflect().Descriptor()
++	chatDesc      = (&mtproto.Chat{}).ProtoReflect().Descriptor()
++	chatFullDesc  = (&mtproto.ChatFull{}).ProtoReflect().Descriptor()
++)
++
++// RewriteOut — ответ/пуш клиенту.
++func (r *Resolver) RewriteOut(ctx context.Context, v any) {
++	if r == nil || v == nil {
++		return
++	}
++	m, ok := v.(proto.Message)
++	if !ok || m == nil {
++		return
++	}
++	r.walkOut(ctx, m.ProtoReflect(), 0)
++}
++
++func (r *Resolver) walkOut(ctx context.Context, m protoreflect.Message, depth int) {
++	if depth > 64 || !m.IsValid() {
++		return
++	}
++	switch m.Descriptor().FullName() {
++	case peerDesc.FullName():
++		if p, ok := m.Interface().(*mtproto.Peer); ok {
++			r.outPeer(ctx, p)
++		}
++		return
++	case messageDesc.FullName():
++		if msg, ok := m.Interface().(*mtproto.Message); ok {
++			r.outMessage(ctx, msg)
++		}
++	case chatDesc.FullName():
++		// @username канала (его не знают msg/biz, которые собирают объект чата)
++		if ch, ok := m.Interface().(*mtproto.Chat); ok && ch.GetPredicateName() == mtproto.Predicate_channel &&
++			ch.Username == nil && mtproto.VsChannelUsernameFunc != nil {
++			if u := mtproto.VsChannelUsernameFunc(ch.Id); u != "" {
++				ch.Username = mtproto.MakeFlagsString(u)
++			}
++		}
++	}
++	m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
++		if fd.Kind() != protoreflect.MessageKind && fd.Kind() != protoreflect.GroupKind {
++			return true
++		}
++		switch {
++		case fd.IsList():
++			l := val.List()
++			for i := 0; i < l.Len(); i++ {
++				r.walkOut(ctx, l.Get(i).Message(), depth+1)
++			}
++		case fd.IsMap():
++			val.Map().Range(func(_ protoreflect.MapKey, mv protoreflect.Value) bool {
++				if fd.MapValue().Kind() == protoreflect.MessageKind {
++					r.walkOut(ctx, mv.Message(), depth+1)
++				}
++				return true
++			})
++		default:
++			r.walkOut(ctx, val.Message(), depth+1)
++		}
++		return true
++	})	// реакции разрешены во всех группах и каналах (свой набор VSети)
++	if m.Descriptor().FullName() == chatFullDesc.FullName() {
++		if cf, ok := m.Interface().(*mtproto.ChatFull); ok && cf.AvailableReactions_FLAGCHATREACTIONS == nil {
++			cf.AvailableReactions_FLAGCHATREACTIONS = mtproto.MakeTLChatReactionsAll(&mtproto.ChatReactions{}).To_ChatReactions()
++		}
++	}
++	// диалог канала: клиенту нужен pts канала
++	if m.Descriptor().FullName() == dialogDesc.FullName() {
++		if d, ok := m.Interface().(*mtproto.Dialog); ok && d.GetPeer().GetChannelId() != 0 && d.Pts == nil {
++			d.Pts = wrapperspb.Int32(1)
++		}
++	}
++}
++
++func (r *Resolver) outPeer(ctx context.Context, p *mtproto.Peer) {
++	if p == nil || p.ChatId == 0 {
++		return
++	}
++	if p.PredicateName != mtproto.Predicate_peerChat && !(p.PredicateName == "" && p.Constructor == mtproto.CRC32_peerChat) {
++		return
++	}
++	if r.Kind(ctx, p.ChatId) == 0 {
++		return
++	}
++	p.PredicateName = mtproto.Predicate_peerChannel
++	p.Constructor = mtproto.CRC32_peerChannel
++	p.ChannelId = p.ChatId
++	p.ChatId = 0
++}
++
++func (r *Resolver) outMessage(ctx context.Context, msg *mtproto.Message) {
++	pid := msg.GetPeerId()
++	if pid == nil || pid.GetChatId() == 0 {
++		return
++	}
++	kind := r.Kind(ctx, pid.GetChatId())
++	if kind == 0 {
++		return
++	}
++	if a := msg.GetAction(); a != nil && a.GetPredicateName() == mtproto.Predicate_messageActionChatCreate {
++		title := a.GetTitle_STRING()
++		if title == "" {
++			title = a.GetTitle_FLAGSTRING().GetValue()
++		}
++		msg.Action = mtproto.MakeTLMessageActionChannelCreate(&mtproto.MessageAction{
++			Title_STRING: title,
++		}).To_MessageAction()
++	}
++	if kind == mtproto.VsKindBroadcast {
++		// пост канала: автор — сам канал
++		msg.Post = true
++		msg.FromId = nil
++		// глазик просмотров: клиент сам спросит точное число (messages.getMessagesViews)
++		if msg.Views == nil && msg.GetPredicateName() == mtproto.Predicate_message {
++			msg.Views = wrapperspb.Int32(1)
++		}
++		// views и forwards в схеме под одним флагом — без forwards Windows-клиент не разбирает ответ
++		if msg.Views != nil && msg.Forwards == nil {
++			msg.Forwards = wrapperspb.Int32(0)
++		}
++	}
++}
++
++// RewriteIn — запрос от клиента: inputPeerChannel/peerChannel → чат.
++func RewriteIn(v any) {
++	m, ok := v.(proto.Message)
++	if !ok || m == nil {
++		return
++	}
++	walkIn(m.ProtoReflect(), 0)
++}
++
++func walkIn(m protoreflect.Message, depth int) {
++	if depth > 32 || !m.IsValid() {
++		return
++	}
++	switch m.Descriptor().FullName() {
++	case inputPeerDesc.FullName():
++		if p, ok := m.Interface().(*mtproto.InputPeer); ok && p.GetPredicateName() == mtproto.Predicate_inputPeerChannel && p.ChannelId != 0 {
++			p.PredicateName = mtproto.Predicate_inputPeerChat
++			p.Constructor = mtproto.CRC32_inputPeerChat
++			p.ChatId = p.ChannelId
++			p.ChannelId = 0
++			p.AccessHash = 0
++		}
++	case peerDesc.FullName():
++		if p, ok := m.Interface().(*mtproto.Peer); ok && p.GetPredicateName() == mtproto.Predicate_peerChannel && p.ChannelId != 0 {
++			p.PredicateName = mtproto.Predicate_peerChat
++			p.Constructor = mtproto.CRC32_peerChat
++			p.ChatId = p.ChannelId
++			p.ChannelId = 0
++		}
++		return
++	}
++	m.Range(func(fd protoreflect.FieldDescriptor, val protoreflect.Value) bool {
++		if fd.Kind() != protoreflect.MessageKind {
++			return true
++		}
++		if fd.IsList() {
++			l := val.List()
++			for i := 0; i < l.Len(); i++ {
++				walkIn(l.Get(i).Message(), depth+1)
++			}
++		} else if !fd.IsMap() {
++			walkIn(val.Message(), depth+1)
++		}
++		return true
++	})
++}
++
++// Default — общий резолвер процесса (bff, sync).
++var Default *Resolver
+diff --git a/pkg/vswebpage/vswebpage.go b/pkg/vswebpage/vswebpage.go
+new file mode 100644
+index 0000000..fd01f4c
+--- /dev/null
++++ b/pkg/vswebpage/vswebpage.go
+@@ -0,0 +1,254 @@
++// VSети: предпросмотр ссылок (карточка с названием, описанием и картинкой), как в Telegram.
++package vswebpage
++
++import (
++	"bytes"
++	"context"
++	"crypto/md5"
++	"encoding/hex"
++	"hash/fnv"
++	"html"
++	"io"
++	"math/rand"
++	"net/http"
++	"net/url"
++	"regexp"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/teamgram/proto/mtproto"
++	dfs_client "github.com/teamgram/teamgram-server/app/service/dfs/client"
++	dfspb "github.com/teamgram/teamgram-server/app/service/dfs/dfs"
++
++	"github.com/zeromicro/go-zero/core/discov"
++	"github.com/zeromicro/go-zero/core/logx"
++	"github.com/zeromicro/go-zero/zrpc"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++var (
++	vsEtcdHosts []string
++	vsDfsOnce   sync.Once
++	vsDfs       dfs_client.DfsClient
++
++	vsWpMu    sync.Mutex
++	vsWpCache = map[string]vsWpItem{}
++
++	vsHttp = &http.Client{Timeout: 8 * time.Second}
++)
++
++type vsWpItem struct {
++	wp *mtproto.WebPage
++	at time.Time
++}
++
++func SetDfsEtcd(hosts []string) { vsEtcdHosts = hosts }
++
++// SetDfsClient — если у процесса уже есть клиент хранилища.
++func SetDfsClient(c dfs_client.DfsClient) { vsDfsOnce.Do(func() {}); vsDfs = c }
++
++func vsDfsClient() dfs_client.DfsClient {
++	vsDfsOnce.Do(func() {
++		cli, err := zrpc.NewClient(zrpc.RpcClientConf{Etcd: discov.EtcdConf{Hosts: vsEtcdHosts, Key: "service.dfs"}, NonBlock: true})
++		if err != nil {
++			logx.Errorf("vs webpage: dfs client: %v", err)
++			return
++		}
++		vsDfs = dfs_client.NewDfsClient(cli)
++	})
++	return vsDfs
++}
++
++var (
++	reMeta  = regexp.MustCompile(`(?is)<meta\s[^>]*>`)
++	reAttr  = regexp.MustCompile(`(?is)(property|name|content|itemprop)\s*=\s*("([^"]*)"|'([^']*)')`)
++	reTitle = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
++)
++
++func vsGet(ctx context.Context, u string, limit int64) ([]byte, string, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
++	if err != nil {
++		return nil, "", err
++	}
++	// так представляются боты предпросмотра — сайты отдают им og-разметку
++	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; TelegramBot (like TwitterBot); VSetiPreview/1.0)")
++	req.Header.Set("Accept-Language", "ru,en;q=0.8")
++	resp, err := vsHttp.Do(req)
++	if err != nil {
++		return nil, "", err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode != 200 {
++		return nil, "", io.ErrUnexpectedEOF
++	}
++	b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
++	return b, resp.Header.Get("Content-Type"), err
++}
++
++func vsParseMeta(page string) map[string]string {
++	m := map[string]string{}
++	head := page
++	if i := strings.Index(strings.ToLower(head), "</head>"); i > 0 {
++		head = head[:i]
++	}
++	for _, tag := range reMeta.FindAllString(head, -1) {
++		var key, val string
++		for _, a := range reAttr.FindAllStringSubmatch(tag, -1) {
++			v := a[3] + a[4]
++			switch strings.ToLower(a[1]) {
++			case "property", "name", "itemprop":
++				key = strings.ToLower(v)
++			case "content":
++				val = v
++			}
++		}
++		if key != "" && val != "" {
++			if _, ok := m[key]; !ok {
++				m[key] = strings.TrimSpace(html.UnescapeString(val))
++			}
++		}
++	}
++	if t := reTitle.FindStringSubmatch(head); len(t) > 1 {
++		m["<title>"] = strings.TrimSpace(html.UnescapeString(t[1]))
++	}
++	return m
++}
++
++func vsFirst(m map[string]string, keys ...string) string {
++	for _, k := range keys {
++		if v := m[k]; v != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++func vsCut(s string, n int) string {
++	r := []rune(s)
++	if len(r) > n {
++		return string(r[:n-1]) + "…"
++	}
++	return s
++}
++
++// vsUploadPhoto — картинку превью кладём в хранилище как обычное фото.
++func vsUploadPhoto(ctx context.Context, data []byte) *mtproto.Photo {
++	d := vsDfsClient()
++	if d == nil || len(data) == 0 || len(data) > 512*1024*10 {
++		return nil
++	}
++	const creator = int64(777000)
++	fileId := rand.Int63()
++	const part = 512 * 1024
++	parts := (len(data) + part - 1) / part
++	for i := 0; i < parts; i++ {
++		end := (i + 1) * part
++		if end > len(data) {
++			end = len(data)
++		}
++		if _, err := d.DfsWriteFilePartData(ctx, &dfspb.TLDfsWriteFilePartData{
++			Creator: creator, FileId: fileId, FilePart: int32(i), Bytes: data[i*part : end],
++		}); err != nil {
++			logx.WithContext(ctx).Errorf("vs webpage: write part: %v", err)
++			return nil
++		}
++	}
++	sum := md5.Sum(data)
++	photo, err := d.DfsUploadPhotoFileV2(ctx, &dfspb.TLDfsUploadPhotoFileV2{
++		Creator: creator,
++		File: mtproto.MakeTLInputFile(&mtproto.InputFile{
++			Id_INT64: fileId, Parts: int32(parts), Name: "preview.jpg", Md5Checksum: hex.EncodeToString(sum[:]),
++		}).To_InputFile(),
++	})
++	if err != nil {
++		logx.WithContext(ctx).Errorf("vs webpage: upload photo: %v", err)
++		return nil
++	}
++	return photo
++}
++
++func Preview(ctx context.Context, rawUrl string) (*mtproto.WebPage, error) {
++	u := rawUrl
++	if !strings.Contains(u, "://") {
++		u = "https://" + u
++	}
++	pu, err := url.Parse(u)
++	if err != nil || pu.Host == "" || (pu.Scheme != "http" && pu.Scheme != "https") {
++		return nil, mtproto.ErrMethodNotImpl
++	}
++	vsWpMu.Lock()
++	if it, ok := vsWpCache[u]; ok && time.Since(it.at) < 6*time.Hour {
++		vsWpMu.Unlock()
++		if it.wp == nil {
++			return nil, mtproto.ErrMethodNotImpl
++		}
++		return it.wp, nil
++	}
++	vsWpMu.Unlock()
++
++	wp := vsBuild(ctx, u, pu)
++	vsWpMu.Lock()
++	vsWpCache[u] = vsWpItem{wp: wp, at: time.Now()}
++	vsWpMu.Unlock()
++	if wp == nil {
++		return nil, mtproto.ErrMethodNotImpl
++	}
++	return wp, nil
++}
++
++func vsBuild(ctx context.Context, u string, pu *url.URL) *mtproto.WebPage {
++	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
++	defer cancel()
++	body, ctype, err := vsGet(ctx, u, 2*1024*1024)
++	if err != nil {
++		logx.Infof("vs webpage: %s: %v", u, err)
++		return nil
++	}
++	if !strings.Contains(strings.ToLower(ctype), "html") {
++		return nil
++	}
++	m := vsParseMeta(string(body))
++	title := vsFirst(m, "og:title", "twitter:title", "<title>")
++	desc := vsFirst(m, "og:description", "twitter:description", "description")
++	site := vsFirst(m, "og:site_name")
++	if site == "" {
++		site = strings.TrimPrefix(pu.Host, "www.")
++	}
++	img := vsFirst(m, "og:image:secure_url", "og:image", "twitter:image", "twitter:image:src", "thumbnailurl")
++	if title == "" && desc == "" && img == "" {
++		return nil
++	}
++	h := fnv.New64a()
++	h.Write([]byte(u))
++	id := int64(h.Sum64() & 0x7fffffffffffffff)
++
++	wtype := "article"
++	if strings.Contains(m["og:type"], "video") {
++		wtype = "video"
++	}
++	wp := &mtproto.WebPage{
++		Id:            id,
++		Url_STRING:    u,
++		DisplayUrl:    strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://"),
++		Hash:          int32(id),
++		Type:          wrapperspb.String(wtype),
++		SiteName:      wrapperspb.String(vsCut(site, 64)),
++		Attributes:    []*mtproto.WebPageAttribute{},
++		HasLargeMedia: wtype == "video",
++	}
++	if title != "" {
++		wp.Title = wrapperspb.String(vsCut(title, 256))
++	}
++	if desc != "" {
++		wp.Description = wrapperspb.String(vsCut(desc, 512))
++	}
++	if img != "" {
++		if iu, err := pu.Parse(img); err == nil {
++			if data, ct, err := vsGet(ctx, iu.String(), 5*1024*1024); err == nil && strings.HasPrefix(strings.ToLower(ct), "image/") && !bytes.HasPrefix(data, []byte("<")) {
++				wp.Photo = vsUploadPhoto(ctx, data)
++			}
++		}
++	}
++	return mtproto.MakeTLWebPage(wp).To_WebPage()
++}
