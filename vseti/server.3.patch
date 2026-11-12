@@ -1,0 +1,123 @@
+diff --git a/app/tools/vsstickers/main.go b/app/tools/vsstickers/main.go
+index b4b7011..34630b1 100644
+--- a/app/tools/vsstickers/main.go
++++ b/app/tools/vsstickers/main.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/teamgram/teamgram-server/pkg/vsstickers"
+ 	"github.com/zeromicro/go-zero/core/conf"
+ 	"github.com/zeromicro/go-zero/core/jsonx"
++	"github.com/zeromicro/go-zero/core/stores/redis"
+ )
+ 
+ type manifest struct {
+@@ -38,6 +39,7 @@ type manifest struct {
+ 			Emoji string `json:"emoji"`
+ 			Mime  string `json:"mime"`
+ 			Size  int64  `json:"size"`
++			Thumb string `json:"thumb"`
+ 		} `json:"stickers"`
+ 	} `json:"sets"`
+ }
+@@ -46,6 +48,10 @@ type mediaConf struct {
+ 	Mysql struct {
+ 		DSN string
+ 	}
++	Cache []struct {
++		Host string
++		Pass string `json:",optional"`
++	} `json:",optional"`
+ }
+ 
+ type dfsConf struct {
+@@ -56,6 +62,7 @@ type dfsConf struct {
+ 		UseSSL          bool `json:",optional"`
+ 		Bucket          struct {
+ 			Documents string `json:",default=documents"`
++			Photos    string `json:",default=photos"`
+ 		} `json:",optional"`
+ 	}
+ }
+@@ -103,6 +110,7 @@ func main() {
+ 	must(json.Unmarshal(raw, &man), "manifest json")
+ 
+ 	ctx := context.Background()
++	uploaded, skipped := 0, 0
+ 	db, err := sql.Open("mysql", mc.Mysql.DSN)
+ 	must(err, "mysql")
+ 	must(db.PingContext(ctx), "mysql ping")
+@@ -121,9 +129,30 @@ func main() {
+ 		bucket = "documents"
+ 	}
+ 
++	photos := dc.Minio.Bucket.Photos
++	if photos == "" {
++		photos = "photos"
++	}
++	var rds []*redis.Redis
++	for _, c := range mc.Cache {
++		if r, err := redis.NewRedis(redis.RedisConf{Host: c.Host, Pass: c.Pass, Type: redis.NodeType}); err == nil {
++			rds = append(rds, r)
++		}
++	}
++	put := func(bkt, path string, data []byte, mime string) {
++		if info, err := mi.StatObject(ctx, bkt, path, minio.StatObjectOptions{}); err == nil && info.Size == int64(len(data)) {
++			skipped++
++			return
++		}
++		_, err := mi.PutObject(ctx, bkt, path, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
++			ContentType: mime, SendContentMd5: true,
++		})
++		must(err, "s3 put "+bkt+"/"+path)
++		uploaded++
++	}
++
+ 	now := time.Now().Unix()
+ 	var allItems []item
+-	uploaded, skipped := 0, 0
+ 	for n, s := range man.Sets {
+ 		setId := vsstickers.OfficialSetIdBase + int64(n+1)
+ 		hash := setAccessHash(setId)
+@@ -135,14 +164,20 @@ func main() {
+ 			data, err := os.ReadFile(filepath.Join(*bundle, st.File))
+ 			must(err, "файл "+st.File)
+ 			path := fmt.Sprintf("%d.dat", id)
+-			if info, err := mi.StatObject(ctx, bucket, path, minio.StatObjectOptions{}); err == nil && info.Size == int64(len(data)) {
+-				skipped++
+-			} else {
+-				_, err = mi.PutObject(ctx, bucket, path, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
+-					ContentType: st.Mime, SendContentMd5: true,
+-				})
+-				must(err, "s3 put "+path)
+-				uploaded++
++			put(bucket, path, data, st.Mime)
++			// превью «m» 128x128 (photos/m/<id>.dat) — без него Android показывает .tgs файлом
++			thumbId := int64(0)
++			if st.Thumb != "" {
++				td, err := os.ReadFile(filepath.Join(*bundle, st.Thumb))
++				must(err, "файл "+st.Thumb)
++				tpath := fmt.Sprintf("m/%d.dat", id)
++				put(photos, tpath, td, "image/webp")
++				_, err = db.ExecContext(ctx, "delete from photo_sizes where photo_size_id = ?", id)
++				must(err, "photo_sizes delete")
++				_, err = db.ExecContext(ctx, "insert into photo_sizes(photo_size_id, size_type, width, height, file_size, file_path, cached_type, cached_bytes) values (?, 'm', 128, 128, ?, ?, 0, '')",
++					id, len(td), tpath)
++				must(err, "photo_sizes insert")
++				thumbId = id
+ 			}
+ 			attrs := vsstickers.StickerAttrs(st.Mime, st.Emoji, setId, hash, 512, 512, nil)
+ 			js, err := jsonx.MarshalToString(attrs)
+@@ -150,9 +185,12 @@ func main() {
+ 			ext := filepath.Ext(st.File)
+ 			_, err = db.ExecContext(ctx, "delete from documents where document_id = ?", id)
+ 			must(err, "documents delete")
+-			_, err = db.ExecContext(ctx, "insert into documents(document_id, access_hash, dc_id, file_path, file_size, uploaded_file_name, ext, mime_type, thumb_id, video_thumb_id, attributes, date2) values (?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
+-				id, int64(vsstickers.StorageType(st.Mime))<<32|(id&0xffffffff), path, len(data), filepath.Base(st.File), ext, st.Mime, js, now)
++			_, err = db.ExecContext(ctx, "insert into documents(document_id, access_hash, dc_id, file_path, file_size, uploaded_file_name, ext, mime_type, thumb_id, video_thumb_id, attributes, date2) values (?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
++				id, int64(vsstickers.StorageType(st.Mime))<<32|(id&0xffffffff), path, len(data), filepath.Base(st.File), ext, st.Mime, thumbId, js, now)
+ 			must(err, "documents insert")
++			for _, r := range rds {
++				_, _ = r.Del(fmt.Sprintf("document_%d", id)) // кэш media
++			}
+ 			items = append(items, item{id, st.Emoji})
+ 		}
+ 		saveSet(ctx, db, setId, hash, s.ShortName, s.Title, 1, kind, n+1, items, now)
