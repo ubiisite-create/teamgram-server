@@ -46,6 +46,7 @@ jobs:
       - name: наборы стикеров (Noto Animated Emoji, CC BY 4.0)
         run: |
           set -e
+          pip install --break-system-packages -q rlottie-python==1.3.6 pillow
           python3 fork/vseti/stickers/gen.py stk/bundle
           tar -C stk -cf out/stickers.tar bundle
           sha256sum out/stickers.tar | cut -c1-64 > out/stickers.sha
