@@ -313,6 +313,12 @@ func (c *MsgCore) sendChatOutgoingMessageV2(fromUserId, fromAuthKeyId, peerChatI
 		err = mtproto.ErrChatWriteForbidden
 		return nil, err
 	}
+	// VSети: в канал пишут только владелец и админы
+	if chat.IsVsBroadcast() && outBox.GetMessage().GetPredicateName() != mtproto.Predicate_messageService {
+		if me, _ := chat.GetImmutableChatParticipant(fromUserId); me == nil || (!me.IsChatMemberCreator() && !me.IsChatMemberAdmin()) {
+			return nil, mtproto.ErrChatWriteForbidden
+		}
+	}
 
 	outBox.Message = plugin.RemakeMessage(
 		c.ctx,

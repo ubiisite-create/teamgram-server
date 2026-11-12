@@ -81,6 +81,15 @@ func (m *ChatInviteExt) ToChatInvite(selfId int64, cb func(idList []int64) []*mt
 		if cb != nil {
 			chatInvite.Participants = cb(m.Participants)
 		}
+		// VSети: канал/супергруппа
+		if m.Chat != nil && m.Chat.IsVsChannel() {
+			chatInvite.Channel = true
+			chatInvite.Broadcast = m.Chat.IsVsBroadcast()
+			chatInvite.Megagroup = m.Chat.IsVsMegagroup()
+			if chatInvite.Broadcast {
+				chatInvite.Participants = []*mtproto.User{}
+			}
+		}
 		return chatInvite
 	case Predicate_chatInvitePeek:
 		return mtproto.MakeTLChatInvitePeek(&mtproto.ChatInvite{

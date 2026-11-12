@@ -7,6 +7,7 @@
 package dao
 
 import (
+	"github.com/teamgram/teamgram-server/pkg/vswebpage"
 	"context"
 
 	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
@@ -23,5 +24,5 @@ func (d *Dao) UsernameResolveUsername(ctx context.Context, in *user.TLUserResolv
 }
 
 func (d *Dao) GetWebpagePreview(ctx context.Context, url string) (*mtproto.WebPage, error) {
-	return nil, mtproto.ErrMethodNotImpl
+	return vswebpage.Preview(ctx, url) // VSети: свой предпросмотр ссылок (pkg/vswebpage)
 }

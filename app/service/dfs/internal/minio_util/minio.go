@@ -82,6 +82,8 @@ func s3PutOptions(encrypted bool, contentType string) minio.PutObjectOptions {
 		options.ServerSideEncryption = encrypt.NewSSE()
 	}
 	options.ContentType = contentType
+	// VSети: новый SeaweedFS не принимает CRC32C-проверку частей от minio-go (Content-Md5 mismatch) — шлём MD5
+	options.SendContentMd5 = true
 
 	return options
 }

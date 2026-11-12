@@ -19,6 +19,7 @@
 package core
 
 import (
+	"strings"
 	"math/rand"
 	"time"
 
@@ -41,12 +42,6 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
 	// check chat title
 	if chatTitle == "" {
 		err := mtproto.ErrChatTitleEmpty
-		c.Logger.Errorf("messages.createChat - error: %v", err)
-		return nil, err
-	}
-
-	if len(iUsers) == 0 {
-		err := mtproto.ErrUsersTooFew
 		c.Logger.Errorf("messages.createChat - error: %v", err)
 		return nil, err
 	}
@@ -98,12 +93,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
 					UserId:  addUser.Id(),
 					KeyType: mtproto.CHAT_INVITE,
 				})
-				if len(rules.Datas) == 0 {
-					missingInvitees = append(missingInvitees, mtproto.MakeTLMissingInvitee(&mtproto.MissingInvitee{
-						PremiumWouldAllowInvite: false,
-						PremiumRequiredForPm:    false,
-						UserId:                  u.UserId,
-					}).To_MissingInvitee())
+				if rules == nil || len(rules.Datas) == 0 {
+					// VSети: правил нет = по умолчанию «Все» (как в Telegram) — приглашать можно
 				} else {
 					allowAddChat := mtproto.CheckPrivacyIsAllow(
 						addUser.Id(),
@@ -130,11 +121,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
 		}
 	}
 
-	if len(userAddList) == 0 {
-		err := mtproto.ErrUsersTooFew
-		c.Logger.Errorf("messages.createChat - error: %v", err)
-		return nil, err
-	}
+	// VSети: группу можно создать и без участников — пригласить потом
+	_ = missingInvitees
 
 	chat, err := c.svcCtx.Dao.ChatClient.Client().ChatCreateChat2(c.ctx, &chatpb.TLChatCreateChat2{
 		CreatorId:  c.MD.UserId,
@@ -148,6 +136,8 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
 		return nil, err
 	}
 
+	// VSети: название без служебного префикса канала
+	vsShowTitle := strings.TrimPrefix(strings.TrimPrefix(chatTitle, mtproto.VsTitlePrefixBroadcast), mtproto.VsTitlePrefixMegagroup)
 	outMessages := []*msgpb.OutboxMessage{
 		msgpb.MakeTLOutboxMessage(&msgpb.OutboxMessage{
 			NoWebpage:  true,
@@ -168,9 +158,9 @@ func (c *ChatsCore) createChat(iUsers []*mtproto.InputUser, chatTitle string, tt
 				ReplyTo:              nil,
 				Date:                 int32(time.Now().Unix()),
 				Action: mtproto.MakeTLMessageActionChatCreate(&mtproto.MessageAction{
-					Title:            chatTitle,
-					Title_FLAGSTRING: mtproto.MakeFlagsString(chatTitle),
-					Title_STRING:     chatTitle,
+					Title:            vsShowTitle,
+					Title_FLAGSTRING: mtproto.MakeFlagsString(vsShowTitle),
+					Title_STRING:     vsShowTitle,
 					Users:            append(userAddList, botAddList...),
 				}).To_MessageAction(),
 				Reactions: nil,

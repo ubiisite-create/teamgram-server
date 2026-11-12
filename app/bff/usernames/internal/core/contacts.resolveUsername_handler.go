@@ -76,10 +76,9 @@ func (c *UsernamesCore) ContactsResolveUsername(in *mtproto.TLContactsResolveUse
 			resolvedPeer.Chats = []*mtproto.Chat{chat.ToUnsafeChat(c.MD.UserId)}
 		}
 	case mtproto.PEER_CHANNEL:
-		if c.svcCtx.Plugin != nil {
-			resolvedPeer.Chats = c.svcCtx.Plugin.GetChannelListByIdList(c.ctx, c.MD.UserId, peer.PeerId)
-		} else {
-			c.Logger.Errorf("contacts.resolveUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
+		// VSети: канал — это группа с признаком
+		if chat2, _ := c.svcCtx.Dao.ChatClient.ChatGetMutableChat(c.ctx, &chat.TLChatGetMutableChat{ChatId: peer.PeerId}); chat2 != nil {
+			resolvedPeer.Chats = []*mtproto.Chat{chat2.ToUnsafeChat(c.MD.UserId)}
 		}
 	}
 

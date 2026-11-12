@@ -1,0 +1,36 @@
+name: VSeti server build
+on:
+  workflow_dispatch:
+  push:
+    branches: [vseti]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: proto (форк с правками VSети)
+        run: git clone --depth 1 -b vseti https://github.com/${{ github.repository_owner }}/proto.git ../tgproto
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.7'
+          cache: true
+      - name: build
+        run: |
+          set -e
+          mkdir -p out
+          for t in bff:./app/bff/bff/cmd/bff biz:./app/service/biz/biz/cmd/biz msg:./app/messenger/msg/cmd/msg sync:./app/messenger/sync/cmd/sync dfs:./app/service/dfs/cmd/dfs; do
+            n=${t%%:*}; p=${t#*:}
+            CGO_ENABLED=1 GOFLAGS=-mod=mod go build -ldflags "-s -w" -o out/$n $p
+            sha256sum out/$n | cut -c1-64 > out/$n.sha
+            xz -T0 -6 -f out/$n
+          done
+          echo "${GITHUB_SHA}" > out/commit.txt
+          ls -la out
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete server-latest -y --cleanup-tag || true
+          gh release create server-latest out/* --title "VSети сервер ${GITHUB_SHA::7}" --notes "Сборка сервера VSети" --target "${GITHUB_SHA}"

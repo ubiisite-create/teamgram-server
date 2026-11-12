@@ -25,8 +25,15 @@ import (
 // UpdatesGetChannelDifference
 // updates.getChannelDifference#3173d78 flags:# force:flags.0?true channel:InputChannel filter:ChannelMessagesFilter pts:int limit:int = updates.ChannelDifference;
 func (c *UpdatesCore) UpdatesGetChannelDifference(in *mtproto.TLUpdatesGetChannelDifference) (*mtproto.Updates_ChannelDifference, error) {
-	// TODO: not impl
-	c.Logger.Errorf("updates.getChannelDifference blocked, License key from https://teamgram.net required to unlock enterprise features.")
-
-	return nil, mtproto.ErrEnterpriseIsBlocked
+	// VSети: сообщения каналов приходят через общий pts пользователя (как в группах),
+	// поэтому разница по каналу всегда пустая — подтверждаем pts клиента.
+	pts := in.GetPts()
+	if pts < 1 {
+		pts = 1
+	}
+	return mtproto.MakeTLUpdatesChannelDifferenceEmpty(&mtproto.Updates_ChannelDifference{
+		Final:   true,
+		Pts:     pts,
+		Timeout: mtproto.MakeFlagsInt32(300),
+	}).To_Updates_ChannelDifference(), nil
 }

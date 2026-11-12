@@ -84,6 +84,7 @@ func (c *ChatCore) ChatCheckChatInvite(in *chat.TLChatCheckChatInvite) (*chat.Ch
 			Photo:             mChat.Photo(),
 			ParticipantsCount: mChat.Chat.ParticipantsCount,
 			Participants:      mChat.ParticipantIdList(),
+			Chat:              mChat, // VSети: чтобы отличать канал
 		}).To_ChatInviteExt()
 
 		return rValue, nil

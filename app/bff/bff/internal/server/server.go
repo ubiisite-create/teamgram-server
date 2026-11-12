@@ -149,9 +149,7 @@ func (s *Server) Initialize() error {
 			}))
 
 		// chats_helper
-		mtproto.RegisterRPCChatsServer(
-			grpcServer,
-			chats_helper.New(chats_helper.Config{
+		vsChatsSvc := chats_helper.New(chats_helper.Config{
 				RpcServerConf:     c.RpcServerConf,
 				UserClient:        c.BizServiceClient,
 				ChatClient:        c.BizServiceClient,
@@ -162,7 +160,8 @@ func (s *Server) Initialize() error {
 				AuthsessionClient: c.AuthSessionClient,
 				IdgenClient:       c.IdgenClient,
 				MessageClient:     c.BizServiceClient,
-			}))
+			})
+		mtproto.RegisterRPCChatsServer(grpcServer, vsChatsSvc)
 
 		// files_helper
 		mtproto.RegisterRPCFilesServer(
@@ -238,9 +237,7 @@ func (s *Server) Initialize() error {
 			}))
 
 		// messages_helper
-		mtproto.RegisterRPCMessagesServer(
-			grpcServer,
-			messages_helper.New(messages_helper.Config{
+		vsMessagesSvc := messages_helper.New(messages_helper.Config{
 				RpcServerConf: c.RpcServerConf,
 				UserClient:    c.BizServiceClient,
 				ChatClient:    c.BizServiceClient,
@@ -250,7 +247,8 @@ func (s *Server) Initialize() error {
 				MessageClient: c.BizServiceClient,
 				MediaClient:   c.MediaClient,
 				SyncClient:    c.SyncClient,
-			}, nil))
+			}, nil)
+		mtproto.RegisterRPCMessagesServer(grpcServer, vsMessagesSvc)
 
 		// notification_helper
 		mtproto.RegisterRPCNotificationServer(
@@ -360,7 +358,14 @@ func (s *Server) Initialize() error {
 			webbrowserhelper.New(webbrowserhelper.Config{
 				RpcServerConf: c.RpcServerConf,
 			}))
+
+		// VSети: каналы и супергруппы поверх групп
+		mtproto.RegisterRPCChannelsServer(grpcServer, newVsChannels(vsChatsSvc, vsMessagesSvc))
+		mtproto.RegisterRPCFragmentServer(grpcServer, vsFragment{})
+		mtproto.RegisterRPCReactionsServer(grpcServer, vsReactions{})
+		mtproto.RegisterRPCWebPageServer(grpcServer, vsWebPage{})
 	})
+	initVsChannels(s.grpcSrv, c)
 
 	// logx.Must(err)
 

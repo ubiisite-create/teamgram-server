@@ -19,6 +19,7 @@
 package svc
 
 import (
+	"github.com/teamgram/teamgram-server/pkg/vswebpage"
 	kafka "github.com/teamgram/marmota/pkg/mq"
 	"github.com/teamgram/marmota/pkg/net/rpcx"
 	"github.com/teamgram/marmota/pkg/stores/kv"
@@ -66,6 +67,8 @@ func NewServiceContext(c config.Config, plugin plugin.MsgPlugin) *ServiceContext
 	if plugin == nil {
 		svcCtx.MsgPlugin = svcCtx.Dao
 	}
+	// VSети: предпросмотр ссылок кладёт картинку через dfs (тот же etcd)
+	vswebpage.SetDfsEtcd(c.IdgenClient.Etcd.Hosts)
 
 	return svcCtx
 }

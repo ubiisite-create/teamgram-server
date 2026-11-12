@@ -20,13 +20,39 @@ package core
 
 import (
 	"github.com/teamgram/proto/mtproto"
+	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
 )
 
 // ChannelsUpdateUsername
 // channels.updateUsername#3514b3de channel:InputChannel username:string = Bool;
 func (c *UsernamesCore) ChannelsUpdateUsername(in *mtproto.TLChannelsUpdateUsername) (*mtproto.Bool, error) {
-	// TODO: not impl
-	c.Logger.Errorf("channels.updateUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
-
-	return nil, mtproto.ErrEnterpriseIsBlocked
+	chat, err := c.vsChannelForEdit(in.GetChannel())
+	if err != nil {
+		return nil, err
+	}
+	name := in.GetUsername()
+	if name != "" && !vsUsernameValid(name) {
+		return nil, mtproto.ErrUsernameInvalid
+	}
+	if name != "" {
+		if ok, _ := c.ChannelsCheckUsername(&mtproto.TLChannelsCheckUsername{Channel: in.GetChannel(), Username: name}); !mtproto.FromBool(ok) {
+			return nil, mtproto.ErrUsernameOccupied
+		}
+	}
+	_, _ = c.svcCtx.Dao.UserClient.UserDeleteUsernameByPeer(c.ctx, &user.TLUserDeleteUsernameByPeer{
+		PeerType: mtproto.PEER_CHANNEL, PeerId: chat.Id(),
+	})
+	if name != "" {
+		r, err := c.svcCtx.Dao.UserClient.UserUpdateUsernameByPeer(c.ctx, &user.TLUserUpdateUsernameByPeer{
+			PeerType: mtproto.PEER_CHANNEL, PeerId: chat.Id(), Username: name,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !mtproto.FromBool(r) {
+			return nil, mtproto.ErrUsernameOccupied
+		}
+	}
+	mtproto.VsForgetChannelUsername(chat.Id())
+	return mtproto.BoolTrue, nil
 }

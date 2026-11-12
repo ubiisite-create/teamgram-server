@@ -10,6 +10,8 @@
 package core
 
 import (
+	"github.com/teamgram/teamgram-server/pkg/vschan"
+	"google.golang.org/protobuf/proto"
 	"context"
 
 	"github.com/teamgram/proto/mtproto"
@@ -177,6 +179,11 @@ func (c *SyncCore) processUpdates(syncType SyncType, userId int64, isBot bool, u
 }
 
 func (c *SyncCore) pushUpdatesToSession(syncType SyncType, userId, permAuthKeyId int64, hasServerId *wrapperspb.StringValue, authKeyId, sessionId *wrapperspb.Int64Value, pushData *mtproto.Updates, notification bool) {
+	// VSети: каналы — peerChat → peerChannel для клиента (копия, чтобы не портить общий объект)
+	if vschan.Default != nil && pushData != nil {
+		pushData = proto.Clone(pushData).(*mtproto.Updates)
+		vschan.Default.RewriteOut(c.ctx, pushData)
+	}
 	if syncType == syncTypeUserMe && hasServerId != nil {
 		c.Logger.Debugf("pushUpdatesToSession - pushData: {server_id: %v, auth_key_id: %v}", hasServerId, authKeyId)
 		if sessionId != nil {

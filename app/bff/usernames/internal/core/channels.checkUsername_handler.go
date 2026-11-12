@@ -19,14 +19,45 @@
 package core
 
 import (
+	"github.com/teamgram/marmota/pkg/strings2"
+	"github.com/teamgram/marmota/pkg/utils"
 	"github.com/teamgram/proto/mtproto"
+	chatpb "github.com/teamgram/teamgram-server/app/service/biz/chat/chat"
+	"github.com/teamgram/teamgram-server/app/service/biz/user/user"
 )
 
 // ChannelsCheckUsername
 // channels.checkUsername#10e6bd2c channel:InputChannel username:string = Bool;
 func (c *UsernamesCore) ChannelsCheckUsername(in *mtproto.TLChannelsCheckUsername) (*mtproto.Bool, error) {
-	// TODO: not impl
-	c.Logger.Errorf("channels.checkUsername blocked, License key from https://teamgram.net required to unlock enterprise features.")
+	if !vsUsernameValid(in.GetUsername()) {
+		return nil, mtproto.ErrUsernameInvalid
+	}
+	existed, err := c.svcCtx.Dao.UserClient.UserCheckChannelUsername(c.ctx, &user.TLUserCheckChannelUsername{
+		ChannelId: in.GetChannel().GetChannelId(),
+		Username:  in.GetUsername(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if existed.GetPredicateName() == user.Predicate_usernameExistedNotMe {
+		return mtproto.BoolFalse, nil
+	}
+	return mtproto.BoolTrue, nil
+}
 
-	return nil, mtproto.ErrEnterpriseIsBlocked
+// VSети: канал = группа с признаком (см. pkg/vschan); имя хранится как PEER_CHANNEL.
+func (c *UsernamesCore) vsChannelForEdit(ch *mtproto.InputChannel) (*mtproto.MutableChat, error) {
+	chat, err := c.svcCtx.Dao.ChatClient.ChatGetMutableChat(c.ctx, &chatpb.TLChatGetMutableChat{ChatId: ch.GetChannelId()})
+	if err != nil || chat == nil || !chat.IsVsChannel() {
+		return nil, mtproto.ErrChannelInvalid
+	}
+	me, ok := chat.GetImmutableChatParticipant(c.MD.UserId)
+	if !ok || !(me.IsChatMemberCreator() || me.IsChatMemberAdmin()) {
+		return nil, mtproto.ErrChatAdminRequired
+	}
+	return chat, nil
+}
+
+func vsUsernameValid(u string) bool {
+	return len(u) >= user.MinUsernameLen && len(u) <= 32 && strings2.IsAlNumString(u) && !utils.IsNumber(u[0])
 }

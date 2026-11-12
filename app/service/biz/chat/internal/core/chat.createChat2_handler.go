@@ -10,6 +10,7 @@
 package core
 
 import (
+	"strings"
 	"math/rand"
 	"time"
 
@@ -29,7 +30,14 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
 		creatorId  = in.CreatorId
 		userIdList = in.UserIdList
 		title      = in.Title
+		vsKind     int32
 	)
+	// VSети: канал/супергруппа — по префиксу названия от bff channels.createChannel
+	if strings.HasPrefix(title, mtproto.VsTitlePrefixBroadcast) {
+		vsKind, title = mtproto.VsKindBroadcast, strings.TrimPrefix(title, mtproto.VsTitlePrefixBroadcast)
+	} else if strings.HasPrefix(title, mtproto.VsTitlePrefixMegagroup) {
+		vsKind, title = mtproto.VsKindMegagroup, strings.TrimPrefix(title, mtproto.VsTitlePrefixMegagroup)
+	}
 
 	// TODO:
 	if chatsDO, err = c.svcCtx.Dao.ChatsDAO.SelectLastCreator(c.ctx, creatorId); err != nil {
@@ -55,7 +63,7 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
 		DefaultBannedRights:    int64(mtproto.MakeDefaultBannedRights().ToBannedRights()),
 		MigratedToId:           0,
 		MigratedToAccessHash:   0,
-		AvailableReactionsType: 0,
+		AvailableReactionsType: vsKind,
 		AvailableReactions:     "",
 		Deactivated:            false,
 		Noforwards:             false,
@@ -107,6 +115,12 @@ func (c *ChatCore) ChatCreateChat2(in *chat.TLChatCreateChat2) (*mtproto.Mutable
 		if err != nil {
 			result.Err = err
 			return
+		}
+		// VSети: вид канала (insert не пишет available_reactions_type)
+		if vsKind > 0 {
+			if _, result.Err = tx.Exec("update chats set available_reactions_type = ? where id = ?", vsKind, chatsDO.Id); result.Err != nil {
+				return
+			}
 		}
 		//chatsDO.Id = chatId
 		for i := 0; i < len(participantDOList); i++ {

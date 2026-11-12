@@ -58,7 +58,7 @@ func (c *ChatCore) ChatAddChatUser(in *chat.TLChatAddChatUser) (*mtproto.Mutable
 		inviterId = chat2.Creator()
 	}
 
-	if chat2.ParticipantsCount() >= 200 {
+	if !chat2.IsVsChannel() && chat2.ParticipantsCount() >= 200 { // VSети: у каналов без лимита 200
 		err = mtproto.ErrUsersTooFew
 		c.Logger.Errorf("chat.addChatUser - error: %v", err)
 		return nil, err
