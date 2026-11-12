@@ -1,0 +1,1713 @@
+diff --git a/app/bff/bff/internal/config/config.go b/app/bff/bff/internal/config/config.go
+index 1bdd55b..5dc7bac 100644
+--- a/app/bff/bff/internal/config/config.go
++++ b/app/bff/bff/internal/config/config.go
+@@ -39,4 +39,5 @@ type Config struct {
+ 	StatusClient              zrpc.RpcClientConf
+ 	SignInServiceNotification []conf.MessageEntityConfig `json:",optional"`
+ 	SignInMessage             []conf.MessageEntityConfig `json:",optional"`
++	VsMysqlDSN                string                     `json:",optional"` // VSети: база для стикеров (та же, что у media)
+ }
+diff --git a/app/bff/bff/internal/server/server.go b/app/bff/bff/internal/server/server.go
+index 0a42eaf..7481adc 100644
+--- a/app/bff/bff/internal/server/server.go
++++ b/app/bff/bff/internal/server/server.go
+@@ -364,8 +364,11 @@ func (s *Server) Initialize() error {
+ 		mtproto.RegisterRPCFragmentServer(grpcServer, vsFragment{})
+ 		mtproto.RegisterRPCReactionsServer(grpcServer, vsReactions{})
+ 		mtproto.RegisterRPCWebPageServer(grpcServer, vsWebPage{})
++		mtproto.RegisterRPCStickersServer(grpcServer, vsStickers{})
++		mtproto.RegisterRPCGifsServer(grpcServer, vsGifs{})
+ 	})
+ 	initVsChannels(s.grpcSrv, c)
++	initVsStickers(c)
+ 
+ 	// logx.Must(err)
+ 
+diff --git a/app/bff/bff/internal/server/vs_channels.go b/app/bff/bff/internal/server/vs_channels.go
+index e88b125..e5ef755 100644
+--- a/app/bff/bff/internal/server/vs_channels.go
++++ b/app/bff/bff/internal/server/vs_channels.go
+@@ -82,6 +82,10 @@ func initVsChannels(srv *zrpc.RpcServer, c config.Config) {
+ 		resp, err := handler(ctx, req)
+ 		if err == nil && resp != nil {
+ 			vschan.Default.RewriteOut(ctx, resp)
++			// VSети: отправленный стикер → «Недавние», GIF → сохранённые
++			if r, ok := req.(*mtproto.TLMessagesSendMedia); ok {
++				go vsAfterSendMedia(context.WithoutCancel(ctx), r.GetMedia())
++			}
+ 		}
+ 		return resp, err
+ 	})
+diff --git a/app/bff/bff/internal/server/vs_stickers.go b/app/bff/bff/internal/server/vs_stickers.go
+new file mode 100644
+index 0000000..2bdfb11
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_stickers.go
+@@ -0,0 +1,1309 @@
++// VSети: стикеры и сохранённые GIF (как в Telegram).
++// Наборы — таблицы vs_sticker_sets / vs_sticker_set_items, установленные у пользователя —
++// vs_user_sticker_sets, недавние/избранные/GIF — vs_user_docs (см. pkg/vsstickers).
++// Сами файлы стикеров — обычные документы (таблица documents + S3), их отдаёт media.
++package server
++
++import (
++	"context"
++	"database/sql"
++	"fmt"
++	"math/rand"
++	"regexp"
++	"sort"
++	"strings"
++	"time"
++	"unicode"
++
++	_ "github.com/go-sql-driver/mysql"
++	"github.com/teamgram/marmota/pkg/net/rpcx"
++	"github.com/teamgram/proto/mtproto"
++	"github.com/teamgram/teamgram-server/app/bff/bff/internal/config"
++	syncpb "github.com/teamgram/teamgram-server/app/messenger/sync/sync"
++	media_client "github.com/teamgram/teamgram-server/app/service/media/client"
++	mediapb "github.com/teamgram/teamgram-server/app/service/media/media"
++	"github.com/teamgram/teamgram-server/pkg/vsstickers"
++
++	"github.com/zeromicro/go-zero/core/jsonx"
++	"github.com/zeromicro/go-zero/core/logx"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++const vsAnimatedEmojiShortName = "VSetiAnimatedEmoji"
++
++var (
++	vsDB       *sql.DB
++	vsMediaCli media_client.MediaClient
++
++	errVsShortNameInvalid  = status.Error(mtproto.ErrBadRequest, "SHORT_NAME_INVALID")
++	errVsShortNameOccupied = status.Error(mtproto.ErrBadRequest, "SHORT_NAME_OCCUPIED")
++	errVsTitleInvalid      = status.Error(mtproto.ErrBadRequest, "PACK_TITLE_INVALID")
++	errVsStickersTooMuch   = status.Error(mtproto.ErrBadRequest, "STICKERS_TOO_MUCH")
++	errVsStickerInvalid    = status.Error(mtproto.ErrBadRequest, "STICKER_ID_INVALID")
++	errVsEmojiInvalid      = status.Error(mtproto.ErrBadRequest, "STICKER_EMOJI_INVALID")
++	errVsInternal          = mtproto.ErrInternalServerError
++
++	reVsShortName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,63}$`)
++)
++
++func initVsStickers(c config.Config) {
++	vsMediaCli = media_client.NewMediaClient(rpcx.GetCachedRpcClient(c.MediaClient))
++	if c.VsMysqlDSN == "" {
++		logx.Errorf("VSети стикеры: нет VsMysqlDSN в bff.yaml — стикеры выключены")
++		return
++	}
++	db, err := sql.Open("mysql", c.VsMysqlDSN)
++	if err != nil {
++		logx.Errorf("VSети стикеры: mysql: %v", err)
++		return
++	}
++	db.SetMaxOpenConns(16)
++	db.SetMaxIdleConns(8)
++	db.SetConnMaxLifetime(time.Hour)
++	for _, q := range vsstickers.Schema {
++		if _, err = db.Exec(q); err != nil {
++			logx.Errorf("VSети стикеры: схема: %v", err)
++			return
++		}
++	}
++	vsDB = db
++}
++
++// ---------- данные ----------
++
++type vsSet struct {
++	id, accessHash int64
++	short, title   string
++	creator        int64
++	official, kind int
++	thumbDoc       int64
++	featured       int
++	created        int64
++}
++
++type vsSetItem struct {
++	docId int64
++	emoji string
++}
++
++type vsUserSet struct {
++	archived  bool
++	installed int32
++	pos       int
++}
++
++const vsSetCols = "set_id, access_hash, short_name, title, creator_id, official, kind, thumb_doc_id, featured, created_at"
++
++func vsScanSets(rows *sql.Rows, err error) []*vsSet {
++	if err != nil {
++		logx.Errorf("vs stickers query: %v", err)
++		return nil
++	}
++	defer rows.Close()
++	var r []*vsSet
++	for rows.Next() {
++		s := &vsSet{}
++		if rows.Scan(&s.id, &s.accessHash, &s.short, &s.title, &s.creator, &s.official, &s.kind, &s.thumbDoc, &s.featured, &s.created) == nil {
++			r = append(r, s)
++		}
++	}
++	return r
++}
++
++func vsGetSetById(ctx context.Context, id int64) *vsSet {
++	l := vsScanSets(vsDB.QueryContext(ctx, "select "+vsSetCols+" from vs_sticker_sets where set_id = ? and deleted = 0", id))
++	if len(l) == 0 {
++		return nil
++	}
++	return l[0]
++}
++
++func vsGetSetByShort(ctx context.Context, short string) *vsSet {
++	l := vsScanSets(vsDB.QueryContext(ctx, "select "+vsSetCols+" from vs_sticker_sets where short_name = ? and deleted = 0", short))
++	if len(l) == 0 {
++		return nil
++	}
++	return l[0]
++}
++
++func vsResolveSet(ctx context.Context, in *mtproto.InputStickerSet) (*vsSet, error) {
++	if vsDB == nil || in == nil {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	var s *vsSet
++	switch in.GetPredicateName() {
++	case mtproto.Predicate_inputStickerSetID:
++		s = vsGetSetById(ctx, in.GetId())
++	case mtproto.Predicate_inputStickerSetShortName:
++		s = vsGetSetByShort(ctx, in.GetShortName())
++	case mtproto.Predicate_inputStickerSetAnimatedEmoji:
++		s = vsGetSetByShort(ctx, vsAnimatedEmojiShortName)
++	}
++	if s == nil {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	return s, nil
++}
++
++func vsSetItems(ctx context.Context, setId int64) []vsSetItem {
++	rows, err := vsDB.QueryContext(ctx, "select document_id, emoji from vs_sticker_set_items where set_id = ? order by pos, document_id", setId)
++	if err != nil {
++		return nil
++	}
++	defer rows.Close()
++	var r []vsSetItem
++	for rows.Next() {
++		var it vsSetItem
++		if rows.Scan(&it.docId, &it.emoji) == nil {
++			r = append(r, it)
++		}
++	}
++	return r
++}
++
++func vsItemsDocIds(items []vsSetItem) []int64 {
++	ids := make([]int64, 0, len(items))
++	for _, it := range items {
++		ids = append(ids, it.docId)
++	}
++	return ids
++}
++
++// vsDocs — документы по id (в том же порядке, пропуская отсутствующие).
++func vsDocs(ctx context.Context, ids []int64) []*mtproto.Document {
++	if len(ids) == 0 {
++		return []*mtproto.Document{}
++	}
++	m := map[int64]*mtproto.Document{}
++	for i := 0; i < len(ids); i += 200 {
++		j := i + 200
++		if j > len(ids) {
++			j = len(ids)
++		}
++		v, err := vsMediaCli.MediaGetDocumentList(ctx, &mediapb.TLMediaGetDocumentList{IdList: ids[i:j]})
++		if err != nil {
++			logx.WithContext(ctx).Errorf("vs stickers: media.getDocumentList: %v", err)
++			continue
++		}
++		for _, d := range v.GetDatas() {
++			if d.GetPredicateName() == mtproto.Predicate_document {
++				m[d.GetId()] = d
++			}
++		}
++	}
++	r := make([]*mtproto.Document, 0, len(ids))
++	for _, id := range ids {
++		if d, ok := m[id]; ok {
++			r = append(r, d)
++		}
++	}
++	return r
++}
++
++func vsDoc(ctx context.Context, id int64) *mtproto.Document {
++	l := vsDocs(ctx, []int64{id})
++	if len(l) == 0 {
++		return nil
++	}
++	return l[0]
++}
++
++func vsNormEmoji(s string) string {
++	return strings.ReplaceAll(s, "️", "")
++}
++
++func vsDocAlt(d *mtproto.Document) (string, bool) {
++	for _, a := range d.GetAttributes() {
++		if a.GetPredicateName() == mtproto.Predicate_documentAttributeSticker {
++			return a.GetAlt(), true
++		}
++	}
++	return "", false
++}
++
++func vsDocIsGif(d *mtproto.Document) bool {
++	for _, a := range d.GetAttributes() {
++		if a.GetPredicateName() == mtproto.Predicate_documentAttributeAnimated {
++			return true
++		}
++	}
++	return false
++}
++
++func vsPacks(items []vsSetItem) []*mtproto.StickerPack {
++	order := []string{}
++	m := map[string][]int64{}
++	for _, it := range items {
++		for _, e := range vsSplitEmoji(it.emoji) {
++			if _, ok := m[e]; !ok {
++				order = append(order, e)
++			}
++			m[e] = append(m[e], it.docId)
++		}
++	}
++	r := make([]*mtproto.StickerPack, 0, len(order))
++	for _, e := range order {
++		r = append(r, mtproto.MakeTLStickerPack(&mtproto.StickerPack{Emoticon: e, Documents: m[e]}).To_StickerPack())
++	}
++	return r
++}
++
++// vsSplitEmoji — в поле emoji может быть несколько смайлов через пробел.
++func vsSplitEmoji(s string) []string {
++	var r []string
++	for _, p := range strings.Fields(s) {
++		if p = vsNormEmoji(p); p != "" {
++			r = append(r, p)
++		}
++	}
++	return r
++}
++
++func vsDocPacks(docs []*mtproto.Document) []*mtproto.StickerPack {
++	items := make([]vsSetItem, 0, len(docs))
++	for _, d := range docs {
++		if alt, ok := vsDocAlt(d); ok && alt != "" {
++			items = append(items, vsSetItem{docId: d.GetId(), emoji: alt})
++		}
++	}
++	return vsPacks(items)
++}
++
++func vsUserSets(ctx context.Context, userId int64) map[int64]*vsUserSet {
++	rows, err := vsDB.QueryContext(ctx, "select set_id, archived, installed_at, pos from vs_user_sticker_sets where user_id = ?", userId)
++	r := map[int64]*vsUserSet{}
++	if err != nil {
++		return r
++	}
++	defer rows.Close()
++	for rows.Next() {
++		var id int64
++		u := &vsUserSet{}
++		var a int
++		if rows.Scan(&id, &a, &u.installed, &u.pos) == nil {
++			u.archived = a != 0
++			r[id] = u
++		}
++	}
++	return r
++}
++
++func vsTLSet(s *vsSet, items []vsSetItem, u *vsUserSet, me int64) *mtproto.StickerSet {
++	ss := &mtproto.StickerSet{
++		Official:   s.official > 0,
++		Creator:    s.creator != 0 && s.creator == me,
++		Id:         s.id,
++		AccessHash: s.accessHash,
++		Title:      s.title,
++		ShortName:  s.short,
++		Count:      int32(len(items)),
++		Hash:       vsstickers.SetHash(vsItemsDocIds(items)),
++		Animated:   s.kind == vsstickers.KindAnimated,
++		Videos:     s.kind == vsstickers.KindVideo,
++	}
++	if u != nil {
++		ss.Archived = u.archived
++		ss.InstalledDate = wrapperspb.Int32(u.installed)
++	}
++	return mtproto.MakeTLStickerSet(ss).To_StickerSet()
++}
++
++func vsFullSet(ctx context.Context, s *vsSet, u *vsUserSet, me int64) *mtproto.Messages_StickerSet {
++	items := vsSetItems(ctx, s.id)
++	return mtproto.MakeTLMessagesStickerSet(&mtproto.Messages_StickerSet{
++		Set:       vsTLSet(s, items, u, me),
++		Packs:     vsPacks(items),
++		Keywords:  []*mtproto.StickerKeyword{},
++		Documents: vsDocs(ctx, vsItemsDocIds(items)),
++	}).To_Messages_StickerSet()
++}
++
++func vsCovered(ctx context.Context, s *vsSet, u *vsUserSet, me int64, full bool) *mtproto.StickerSetCovered {
++	items := vsSetItems(ctx, s.id)
++	set := vsTLSet(s, items, u, me)
++	if full {
++		return mtproto.MakeTLStickerSetFullCovered(&mtproto.StickerSetCovered{
++			Set:       set,
++			Packs:     vsPacks(items),
++			Keywords:  []*mtproto.StickerKeyword{},
++			Documents: vsDocs(ctx, vsItemsDocIds(items)),
++		}).To_StickerSetCovered()
++	}
++	if len(items) == 0 {
++		return mtproto.MakeTLStickerSetNoCovered(&mtproto.StickerSetCovered{Set: set}).To_StickerSetCovered()
++	}
++	cover := vsDoc(ctx, items[0].docId)
++	if cover == nil {
++		return mtproto.MakeTLStickerSetNoCovered(&mtproto.StickerSetCovered{Set: set}).To_StickerSetCovered()
++	}
++	return mtproto.MakeTLStickerSetCovered(&mtproto.StickerSetCovered{Set: set, Cover: cover}).To_StickerSetCovered()
++}
++
++// vsEnsureDefaults — новому пользователю ставим официальные наборы VSети (как Telegram ставит стандартные).
++func vsEnsureDefaults(ctx context.Context, userId int64) {
++	var done int
++	err := vsDB.QueryRowContext(ctx, "select defaults_done from vs_user_sticker_state where user_id = ?", userId).Scan(&done)
++	if err == nil && done != 0 {
++		return
++	}
++	now := time.Now().Unix()
++	_, _ = vsDB.ExecContext(ctx, "insert ignore into vs_user_sticker_sets(user_id, set_id, pos, archived, installed_at) "+
++		"select ?, set_id, featured, 0, ? from vs_sticker_sets where official = 1 and deleted = 0", userId, now)
++	_, _ = vsDB.ExecContext(ctx, "insert into vs_user_sticker_state(user_id, defaults_done, featured_read) values (?, 1, ?) "+
++		"on duplicate key update defaults_done = 1", userId, now)
++}
++
++func vsInstall(ctx context.Context, userId, setId int64, archived bool) {
++	var minPos sql.NullInt64
++	_ = vsDB.QueryRowContext(ctx, "select min(pos) from vs_user_sticker_sets where user_id = ?", userId).Scan(&minPos)
++	pos := int64(0)
++	if minPos.Valid {
++		pos = minPos.Int64 - 1
++	}
++	a := 0
++	if archived {
++		a = 1
++	}
++	_, _ = vsDB.ExecContext(ctx, "insert into vs_user_sticker_sets(user_id, set_id, pos, archived, installed_at) values (?, ?, ?, ?, ?) "+
++		"on duplicate key update pos = values(pos), archived = values(archived), installed_at = values(installed_at)",
++		userId, setId, pos, a, time.Now().Unix())
++}
++
++// vsNotifyMe — то же изменение на других устройствах пользователя.
++func vsNotifyMe(ctx context.Context, updates ...*mtproto.Update) {
++	if vsSyncCli == nil {
++		return
++	}
++	md := vsMD(ctx)
++	if md == nil {
++		return
++	}
++	_, _ = vsSyncCli.SyncUpdatesNotMe(ctx, &syncpb.TLSyncUpdatesNotMe{
++		UserId:        md.UserId,
++		PermAuthKeyId: md.PermAuthKeyId,
++		Updates: mtproto.MakeTLUpdates(&mtproto.Updates{
++			Updates: updates,
++			Users:   []*mtproto.User{},
++			Chats:   []*mtproto.Chat{},
++			Date:    int32(time.Now().Unix()),
++		}).To_Updates(),
++	})
++}
++
++func vsUpdStickerSets() *mtproto.Update {
++	return mtproto.MakeTLUpdateStickerSets(&mtproto.Update{}).To_Update()
++}
++
++// --- недавние / избранные / GIF ---
++
++func vsUserDocIds(ctx context.Context, userId int64, list, limit int) ([]int64, []int32) {
++	rows, err := vsDB.QueryContext(ctx, "select document_id, date from vs_user_docs where user_id = ? and list = ? order by date desc, document_id desc limit ?", userId, list, limit)
++	if err != nil {
++		return nil, nil
++	}
++	defer rows.Close()
++	var ids []int64
++	var dates []int32
++	for rows.Next() {
++		var id int64
++		var d int32
++		if rows.Scan(&id, &d) == nil {
++			ids = append(ids, id)
++			dates = append(dates, d)
++		}
++	}
++	return ids, dates
++}
++
++func vsUserDocAdd(ctx context.Context, userId int64, list int, docId int64, limit int) {
++	_, _ = vsDB.ExecContext(ctx, "insert into vs_user_docs(user_id, list, document_id, date) values (?, ?, ?, ?) on duplicate key update date = values(date)",
++		userId, list, docId, time.Now().Unix())
++	ids, _ := vsUserDocIds(ctx, userId, list, 1000)
++	for i := limit; i < len(ids); i++ {
++		_, _ = vsDB.ExecContext(ctx, "delete from vs_user_docs where user_id = ? and list = ? and document_id = ?", userId, list, ids[i])
++	}
++}
++
++func vsUserDocDel(ctx context.Context, userId int64, list int, docId int64) {
++	_, _ = vsDB.ExecContext(ctx, "delete from vs_user_docs where user_id = ? and list = ? and document_id = ?", userId, list, docId)
++}
++
++// vsAfterSendMedia — как Telegram: отправленный стикер попадает в «Недавние», отправленная GIF — в сохранённые.
++func vsAfterSendMedia(ctx context.Context, media *mtproto.InputMedia) {
++	if vsDB == nil || media.GetPredicateName() != mtproto.Predicate_inputMediaDocument {
++		return
++	}
++	md := vsMD(ctx)
++	id := media.GetId_INPUTDOCUMENT().GetId()
++	if md == nil || id == 0 {
++		return
++	}
++	d := vsDoc(ctx, id)
++	if d == nil {
++		return
++	}
++	if _, ok := vsDocAlt(d); ok {
++		vsUserDocAdd(ctx, md.UserId, vsstickers.ListRecent, id, vsstickers.MaxRecent)
++		vsNotifyMe(ctx, mtproto.MakeTLUpdateRecentStickers(&mtproto.Update{}).To_Update())
++	} else if vsDocIsGif(d) {
++		vsUserDocAdd(ctx, md.UserId, vsstickers.ListGifs, id, vsstickers.MaxGifs)
++		vsNotifyMe(ctx, mtproto.MakeTLUpdateSavedGifs(&mtproto.Update{}).To_Update())
++	}
++}
++
++// --- свои наборы: атрибуты документа ---
++
++func vsSetDocAttrs(ctx context.Context, docId int64, s *vsSet, emoji string) error {
++	d := vsDoc(ctx, docId)
++	if d == nil {
++		return errVsStickerInvalid
++	}
++	var w, h int32 = 512, 512
++	attrs := vsstickers.StickerAttrs(d.GetMimeType(), emoji, s.id, s.accessHash, w, h, d.GetAttributes())
++	js, err := jsonx.MarshalToString(attrs)
++	if err != nil {
++		return errVsInternal
++	}
++	if _, err = vsDB.ExecContext(ctx, "update documents set attributes = ? where document_id = ?", js, docId); err != nil {
++		logx.WithContext(ctx).Errorf("vs stickers: documents update: %v", err)
++		return errVsInternal
++	}
++	// кэш media (go-zero cache: ключ document_<id>)
++	if vsKV != nil {
++		_, _ = vsKV.Del(fmt.Sprintf("document_%d", docId))
++	}
++	return nil
++}
++
++func vsCheckDocMime(d *mtproto.Document) bool {
++	switch d.GetMimeType() {
++	case "image/webp", "image/png", "application/x-tgsticker", "video/webm":
++		return true
++	}
++	return false
++}
++
++func vsTranslit(s string) string {
++	tr := map[rune]string{'а': "a", 'б': "b", 'в': "v", 'г': "g", 'д': "d", 'е': "e", 'ё': "e", 'ж': "zh", 'з': "z", 'и': "i", 'й': "y",
++		'к': "k", 'л': "l", 'м': "m", 'н': "n", 'о': "o", 'п': "p", 'р': "r", 'с': "s", 'т': "t", 'у': "u", 'ф': "f", 'х': "h",
++		'ц': "ts", 'ч': "ch", 'ш': "sh", 'щ': "sch", 'ъ': "", 'ы': "y", 'ь': "", 'э': "e", 'ю': "yu", 'я': "ya"}
++	var b strings.Builder
++	for _, r := range strings.ToLower(s) {
++		switch {
++		case r < 128 && (unicode.IsLetter(r) || unicode.IsDigit(r)):
++			b.WriteRune(r)
++		case tr[r] != "":
++			b.WriteString(tr[r])
++		case unicode.IsSpace(r) || r == '_' || r == '-':
++			if b.Len() > 0 && !strings.HasSuffix(b.String(), "_") {
++				b.WriteByte('_')
++			}
++		}
++	}
++	r := strings.Trim(b.String(), "_")
++	if r == "" || !unicode.IsLetter(rune(r[0])) {
++		r = "set_" + r
++	}
++	if len(r) > 50 {
++		r = r[:50]
++	}
++	return r
++}
++
++// ---------- RPCStickers ----------
++
++type vsStickers struct {
++	mtproto.UnimplementedRPCStickersServer
++}
++
++func (vsStickers) me(ctx context.Context) int64 {
++	if md := vsMD(ctx); md != nil {
++		return md.UserId
++	}
++	return 0
++}
++
++func (s vsStickers) MessagesGetAllStickers(ctx context.Context, in *mtproto.TLMessagesGetAllStickers) (*mtproto.Messages_AllStickers, error) {
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesAllStickers(&mtproto.Messages_AllStickers{Sets: []*mtproto.StickerSet{}}).To_Messages_AllStickers(), nil
++	}
++	me := s.me(ctx)
++	vsEnsureDefaults(ctx, me)
++	us := vsUserSets(ctx, me)
++	type row struct {
++		s *vsSet
++		u *vsUserSet
++	}
++	var rs []row
++	for id, u := range us {
++		if u.archived {
++			continue
++		}
++		if set := vsGetSetById(ctx, id); set != nil {
++			rs = append(rs, row{set, u})
++		}
++	}
++	sort.SliceStable(rs, func(i, j int) bool {
++		if rs[i].u.pos != rs[j].u.pos {
++			return rs[i].u.pos < rs[j].u.pos
++		}
++		return rs[i].u.installed > rs[j].u.installed
++	})
++	sets := make([]*mtproto.StickerSet, 0, len(rs))
++	var hash int64
++	for _, r := range rs {
++		ts := vsTLSet(r.s, vsSetItems(ctx, r.s.id), r.u, me)
++		hash = vsstickers.CalcHash(hash, int64(ts.Hash))
++		sets = append(sets, ts)
++	}
++	if in.GetHash() != 0 && in.GetHash() == hash {
++		return mtproto.MakeTLMessagesAllStickersNotModified(nil).To_Messages_AllStickers(), nil
++	}
++	return mtproto.MakeTLMessagesAllStickers(&mtproto.Messages_AllStickers{Hash: hash, Sets: sets}).To_Messages_AllStickers(), nil
++}
++
++func (s vsStickers) MessagesGetStickerSet(ctx context.Context, in *mtproto.TLMessagesGetStickerSet) (*mtproto.Messages_StickerSet, error) {
++	set, err := vsResolveSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	me := s.me(ctx)
++	full := vsFullSet(ctx, set, vsUserSets(ctx, me)[set.id], me)
++	if in.GetHash() != 0 && in.GetHash() == full.GetSet().GetHash() {
++		return mtproto.MakeTLMessagesStickerSetNotModified(nil).To_Messages_StickerSet(), nil
++	}
++	return full, nil
++}
++
++func (s vsStickers) MessagesInstallStickerSet(ctx context.Context, in *mtproto.TLMessagesInstallStickerSet) (*mtproto.Messages_StickerSetInstallResult, error) {
++	set, err := vsResolveSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	if set.official > 1 {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	vsInstall(ctx, s.me(ctx), set.id, mtproto.FromBool(in.GetArchived()))
++	vsNotifyMe(ctx, vsUpdStickerSets())
++	return mtproto.MakeTLMessagesStickerSetInstallResultSuccess(nil).To_Messages_StickerSetInstallResult(), nil
++}
++
++func (s vsStickers) MessagesUninstallStickerSet(ctx context.Context, in *mtproto.TLMessagesUninstallStickerSet) (*mtproto.Bool, error) {
++	set, err := vsResolveSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	_, _ = vsDB.ExecContext(ctx, "delete from vs_user_sticker_sets where user_id = ? and set_id = ?", s.me(ctx), set.id)
++	vsNotifyMe(ctx, vsUpdStickerSets())
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesReorderStickerSets(ctx context.Context, in *mtproto.TLMessagesReorderStickerSets) (*mtproto.Bool, error) {
++	if vsDB == nil || in.GetMasks() || in.GetEmojis() {
++		return mtproto.BoolTrue, nil
++	}
++	me := s.me(ctx)
++	for i, id := range in.GetOrder() {
++		_, _ = vsDB.ExecContext(ctx, "update vs_user_sticker_sets set pos = ? where user_id = ? and set_id = ?", i, me, id)
++	}
++	vsNotifyMe(ctx, mtproto.MakeTLUpdateStickerSetsOrder(&mtproto.Update{Order_VECTORINT64: in.GetOrder()}).To_Update())
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesToggleStickerSets(ctx context.Context, in *mtproto.TLMessagesToggleStickerSets) (*mtproto.Bool, error) {
++	me := s.me(ctx)
++	for _, is := range in.GetStickersets() {
++		set, err := vsResolveSet(ctx, is)
++		if err != nil {
++			continue
++		}
++		switch {
++		case in.GetUninstall():
++			_, _ = vsDB.ExecContext(ctx, "delete from vs_user_sticker_sets where user_id = ? and set_id = ?", me, set.id)
++		case in.GetArchive():
++			vsInstall(ctx, me, set.id, true)
++		case in.GetUnarchive():
++			vsInstall(ctx, me, set.id, false)
++		}
++	}
++	vsNotifyMe(ctx, vsUpdStickerSets())
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesGetArchivedStickers(ctx context.Context, in *mtproto.TLMessagesGetArchivedStickers) (*mtproto.Messages_ArchivedStickers, error) {
++	r := &mtproto.Messages_ArchivedStickers{Sets: []*mtproto.StickerSetCovered{}}
++	if vsDB == nil || in.GetMasks() || in.GetEmojis() {
++		return mtproto.MakeTLMessagesArchivedStickers(r).To_Messages_ArchivedStickers(), nil
++	}
++	me := s.me(ctx)
++	us := vsUserSets(ctx, me)
++	type row struct {
++		id int64
++		u  *vsUserSet
++	}
++	var rs []row
++	for id, u := range us {
++		if u.archived {
++			rs = append(rs, row{id, u})
++		}
++	}
++	sort.Slice(rs, func(i, j int) bool { return rs[i].u.installed > rs[j].u.installed })
++	r.Count = int32(len(rs))
++	skip := in.GetOffsetId() != 0
++	limit := int(in.GetLimit())
++	if limit <= 0 || limit > 100 {
++		limit = 100
++	}
++	for _, x := range rs {
++		if skip {
++			if x.id == in.GetOffsetId() {
++				skip = false
++			}
++			continue
++		}
++		if set := vsGetSetById(ctx, x.id); set != nil {
++			r.Sets = append(r.Sets, vsCovered(ctx, set, x.u, me, false))
++		}
++		if len(r.Sets) >= limit {
++			break
++		}
++	}
++	return mtproto.MakeTLMessagesArchivedStickers(r).To_Messages_ArchivedStickers(), nil
++}
++
++func (s vsStickers) MessagesGetFeaturedStickers(ctx context.Context, in *mtproto.TLMessagesGetFeaturedStickers) (*mtproto.Messages_FeaturedStickers, error) {
++	r := &mtproto.Messages_FeaturedStickers{Sets: []*mtproto.StickerSetCovered{}, Unread: []int64{}}
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesFeaturedStickers(r).To_Messages_FeaturedStickers(), nil
++	}
++	me := s.me(ctx)
++	vsEnsureDefaults(ctx, me)
++	var readAt int64
++	_ = vsDB.QueryRowContext(ctx, "select featured_read from vs_user_sticker_state where user_id = ?", me).Scan(&readAt)
++	us := vsUserSets(ctx, me)
++	sets := vsScanSets(vsDB.QueryContext(ctx, "select "+vsSetCols+" from vs_sticker_sets where deleted = 0 and official = 1 order by featured, set_id"))
++	var hash int64
++	for _, set := range sets {
++		if u, ok := us[set.id]; ok && !u.archived {
++			continue
++		}
++		r.Sets = append(r.Sets, vsCovered(ctx, set, us[set.id], me, true))
++		hash = vsstickers.CalcHash(hash, set.id)
++		if set.created > readAt {
++			r.Unread = append(r.Unread, set.id)
++			hash = vsstickers.CalcHash(hash, 1)
++		}
++	}
++	r.Count = int32(len(r.Sets))
++	r.Hash = hash
++	if in.GetHash() != 0 && in.GetHash() == hash {
++		return mtproto.MakeTLMessagesFeaturedStickersNotModified(&mtproto.Messages_FeaturedStickers{Count: r.Count}).To_Messages_FeaturedStickers(), nil
++	}
++	return mtproto.MakeTLMessagesFeaturedStickers(r).To_Messages_FeaturedStickers(), nil
++}
++
++func (s vsStickers) MessagesGetOldFeaturedStickers(ctx context.Context, in *mtproto.TLMessagesGetOldFeaturedStickers) (*mtproto.Messages_FeaturedStickers, error) {
++	return mtproto.MakeTLMessagesFeaturedStickers(&mtproto.Messages_FeaturedStickers{
++		Sets: []*mtproto.StickerSetCovered{}, Unread: []int64{},
++	}).To_Messages_FeaturedStickers(), nil
++}
++
++func (s vsStickers) MessagesReadFeaturedStickers(ctx context.Context, in *mtproto.TLMessagesReadFeaturedStickers) (*mtproto.Bool, error) {
++	if vsDB != nil {
++		_, _ = vsDB.ExecContext(ctx, "insert into vs_user_sticker_state(user_id, defaults_done, featured_read) values (?, 0, ?) on duplicate key update featured_read = values(featured_read)",
++			s.me(ctx), time.Now().Unix())
++		vsNotifyMe(ctx, mtproto.MakeTLUpdateReadFeaturedStickers(&mtproto.Update{}).To_Update())
++	}
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesGetRecentStickers(ctx context.Context, in *mtproto.TLMessagesGetRecentStickers) (*mtproto.Messages_RecentStickers, error) {
++	r := &mtproto.Messages_RecentStickers{Packs: []*mtproto.StickerPack{}, Stickers: []*mtproto.Document{}, Dates: []int32{}}
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesRecentStickers(r).To_Messages_RecentStickers(), nil
++	}
++	list := vsstickers.ListRecent
++	if in.GetAttached() {
++		list = vsstickers.ListRecentAttached
++	}
++	ids, dates := vsUserDocIds(ctx, s.me(ctx), list, vsstickers.MaxRecent)
++	docs := vsDocs(ctx, ids)
++	dm := map[int64]int32{}
++	for i, id := range ids {
++		dm[id] = dates[i]
++	}
++	hashIds := make([]int64, 0, len(docs))
++	for _, d := range docs {
++		hashIds = append(hashIds, d.GetId())
++		r.Dates = append(r.Dates, dm[d.GetId()])
++	}
++	r.Hash = vsstickers.HashIds(hashIds)
++	if in.GetHash() != 0 && in.GetHash() == r.Hash {
++		return mtproto.MakeTLMessagesRecentStickersNotModified(nil).To_Messages_RecentStickers(), nil
++	}
++	r.Stickers = docs
++	r.Packs = vsDocPacks(docs)
++	return mtproto.MakeTLMessagesRecentStickers(r).To_Messages_RecentStickers(), nil
++}
++
++func (s vsStickers) MessagesSaveRecentSticker(ctx context.Context, in *mtproto.TLMessagesSaveRecentSticker) (*mtproto.Bool, error) {
++	if vsDB == nil {
++		return mtproto.BoolTrue, nil
++	}
++	list := vsstickers.ListRecent
++	if in.GetAttached() {
++		list = vsstickers.ListRecentAttached
++	}
++	id := in.GetId().GetId()
++	if mtproto.FromBool(in.GetUnsave()) {
++		vsUserDocDel(ctx, s.me(ctx), list, id)
++	} else {
++		if vsDoc(ctx, id) == nil {
++			return nil, errVsStickerInvalid
++		}
++		vsUserDocAdd(ctx, s.me(ctx), list, id, vsstickers.MaxRecent)
++	}
++	vsNotifyMe(ctx, mtproto.MakeTLUpdateRecentStickers(&mtproto.Update{}).To_Update())
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesClearRecentStickers(ctx context.Context, in *mtproto.TLMessagesClearRecentStickers) (*mtproto.Bool, error) {
++	if vsDB != nil {
++		list := vsstickers.ListRecent
++		if in.GetAttached() {
++			list = vsstickers.ListRecentAttached
++		}
++		_, _ = vsDB.ExecContext(ctx, "delete from vs_user_docs where user_id = ? and list = ?", s.me(ctx), list)
++		vsNotifyMe(ctx, mtproto.MakeTLUpdateRecentStickers(&mtproto.Update{}).To_Update())
++	}
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) MessagesGetFavedStickers(ctx context.Context, in *mtproto.TLMessagesGetFavedStickers) (*mtproto.Messages_FavedStickers, error) {
++	r := &mtproto.Messages_FavedStickers{Packs: []*mtproto.StickerPack{}, Stickers: []*mtproto.Document{}}
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesFavedStickers(r).To_Messages_FavedStickers(), nil
++	}
++	ids, _ := vsUserDocIds(ctx, s.me(ctx), vsstickers.ListFaved, vsstickers.MaxFaved)
++	docs := vsDocs(ctx, ids)
++	hashIds := make([]int64, 0, len(docs))
++	for _, d := range docs {
++		hashIds = append(hashIds, d.GetId())
++	}
++	r.Hash = vsstickers.HashIds(hashIds)
++	if in.GetHash() != 0 && in.GetHash() == r.Hash {
++		return mtproto.MakeTLMessagesFavedStickersNotModified(nil).To_Messages_FavedStickers(), nil
++	}
++	r.Stickers = docs
++	r.Packs = vsDocPacks(docs)
++	return mtproto.MakeTLMessagesFavedStickers(r).To_Messages_FavedStickers(), nil
++}
++
++func (s vsStickers) MessagesFaveSticker(ctx context.Context, in *mtproto.TLMessagesFaveSticker) (*mtproto.Bool, error) {
++	if vsDB == nil {
++		return mtproto.BoolTrue, nil
++	}
++	id := in.GetId().GetId()
++	if mtproto.FromBool(in.GetUnfave()) {
++		vsUserDocDel(ctx, s.me(ctx), vsstickers.ListFaved, id)
++	} else {
++		if vsDoc(ctx, id) == nil {
++			return nil, errVsStickerInvalid
++		}
++		vsUserDocAdd(ctx, s.me(ctx), vsstickers.ListFaved, id, vsstickers.MaxFaved)
++	}
++	vsNotifyMe(ctx, mtproto.MakeTLUpdateFavedStickers(&mtproto.Update{}).To_Update())
++	return mtproto.BoolTrue, nil
++}
++
++// vsStickersByEmoji — стикеры с этим смайлом: сначала из установленных наборов, потом из остальных официальных.
++func vsStickersByEmoji(ctx context.Context, me int64, emoticon string, limit int, onlyInstalled bool) []int64 {
++	e := vsNormEmoji(strings.TrimSpace(emoticon))
++	if e == "" {
++		return nil
++	}
++	q := "select i.document_id, i.emoji, (u.set_id is not null) as inst from vs_sticker_set_items i " +
++		"join vs_sticker_sets s on s.set_id = i.set_id and s.deleted = 0 " +
++		"left join vs_user_sticker_sets u on u.set_id = i.set_id and u.user_id = ? and u.archived = 0 " +
++		"where i.emoji like ? "
++	if onlyInstalled {
++		q += "and u.set_id is not null "
++	} else {
++		q += "and (u.set_id is not null or s.official = 1) "
++	}
++	q += "order by inst desc, u.pos, i.pos limit 500"
++	rows, err := vsDB.QueryContext(ctx, q, me, "%"+e+"%")
++	if err != nil {
++		logx.WithContext(ctx).Errorf("vs stickers by emoji: %v", err)
++		return nil
++	}
++	defer rows.Close()
++	seen := map[int64]bool{}
++	var ids []int64
++	for rows.Next() {
++		var id int64
++		var em string
++		var inst bool
++		if rows.Scan(&id, &em, &inst) != nil || seen[id] {
++			continue
++		}
++		match := false
++		for _, x := range vsSplitEmoji(em) {
++			if x == e {
++				match = true
++			}
++		}
++		if match {
++			seen[id] = true
++			ids = append(ids, id)
++			if len(ids) >= limit {
++				break
++			}
++		}
++	}
++	return ids
++}
++
++func (s vsStickers) MessagesGetStickers(ctx context.Context, in *mtproto.TLMessagesGetStickers) (*mtproto.Messages_Stickers, error) {
++	r := &mtproto.Messages_Stickers{Stickers: []*mtproto.Document{}}
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesStickers(r).To_Messages_Stickers(), nil
++	}
++	ids := vsStickersByEmoji(ctx, s.me(ctx), in.GetEmoticon(), 50, true)
++	r.Hash = vsstickers.HashIds(ids)
++	if in.GetHash() != 0 && in.GetHash() == r.Hash {
++		return mtproto.MakeTLMessagesStickersNotModified(nil).To_Messages_Stickers(), nil
++	}
++	r.Stickers = vsDocs(ctx, ids)
++	return mtproto.MakeTLMessagesStickers(r).To_Messages_Stickers(), nil
++}
++
++func (s vsStickers) MessagesSearchStickers(ctx context.Context, in *mtproto.TLMessagesSearchStickers) (*mtproto.Messages_FoundStickers, error) {
++	r := &mtproto.Messages_FoundStickers{Stickers: []*mtproto.Document{}}
++	if vsDB == nil || in.GetEmojis() {
++		return mtproto.MakeTLMessagesFoundStickers(r).To_Messages_FoundStickers(), nil
++	}
++	q := in.GetEmoticon()
++	if q == "" {
++		q = in.GetQ()
++	}
++	limit := int(in.GetLimit())
++	if limit <= 0 || limit > 100 {
++		limit = 50
++	}
++	ids := vsStickersByEmoji(ctx, s.me(ctx), q, int(in.GetOffset())+limit, false)
++	if int(in.GetOffset()) < len(ids) {
++		ids = ids[in.GetOffset():]
++	} else {
++		ids = nil
++	}
++	r.Hash = vsstickers.HashIds(ids)
++	r.Stickers = vsDocs(ctx, ids)
++	return mtproto.MakeTLMessagesFoundStickers(r).To_Messages_FoundStickers(), nil
++}
++
++func (s vsStickers) MessagesSearchStickerSets(ctx context.Context, in *mtproto.TLMessagesSearchStickerSets) (*mtproto.Messages_FoundStickerSets, error) {
++	r := &mtproto.Messages_FoundStickerSets{Sets: []*mtproto.StickerSetCovered{}}
++	q := strings.TrimSpace(in.GetQ())
++	if vsDB == nil || q == "" {
++		return mtproto.MakeTLMessagesFoundStickerSets(r).To_Messages_FoundStickerSets(), nil
++	}
++	like := "%" + strings.NewReplacer("%", "", "_", "\\_").Replace(q) + "%"
++	cond := ""
++	if in.GetExcludeFeatured() {
++		cond = " and official <> 1"
++	}
++	sets := vsScanSets(vsDB.QueryContext(ctx, "select "+vsSetCols+" from vs_sticker_sets where deleted = 0 and official <> 2"+cond+
++		" and (title like ? or short_name like ?) order by official desc, created_at desc limit 30", like, like))
++	me := s.me(ctx)
++	us := vsUserSets(ctx, me)
++	ids := []int64{}
++	for _, set := range sets {
++		r.Sets = append(r.Sets, vsCovered(ctx, set, us[set.id], me, true))
++		ids = append(ids, set.id)
++	}
++	r.Hash = vsstickers.HashIds(ids)
++	if in.GetHash() != 0 && in.GetHash() == r.Hash {
++		return mtproto.MakeTLMessagesFoundStickerSetsNotModified(nil).To_Messages_FoundStickerSets(), nil
++	}
++	return mtproto.MakeTLMessagesFoundStickerSets(r).To_Messages_FoundStickerSets(), nil
++}
++
++func (s vsStickers) MessagesSearchEmojiStickerSets(ctx context.Context, in *mtproto.TLMessagesSearchEmojiStickerSets) (*mtproto.Messages_FoundStickerSets, error) {
++	return mtproto.MakeTLMessagesFoundStickerSets(&mtproto.Messages_FoundStickerSets{Sets: []*mtproto.StickerSetCovered{}}).To_Messages_FoundStickerSets(), nil
++}
++
++func (s vsStickers) MessagesGetMaskStickers(ctx context.Context, in *mtproto.TLMessagesGetMaskStickers) (*mtproto.Messages_AllStickers, error) {
++	return mtproto.MakeTLMessagesAllStickers(&mtproto.Messages_AllStickers{Sets: []*mtproto.StickerSet{}}).To_Messages_AllStickers(), nil
++}
++
++func (s vsStickers) MessagesGetAttachedStickers(ctx context.Context, in *mtproto.TLMessagesGetAttachedStickers) (*mtproto.Vector_StickerSetCovered, error) {
++	return &mtproto.Vector_StickerSetCovered{Datas: []*mtproto.StickerSetCovered{}}, nil
++}
++
++func (s vsStickers) MessagesGetMyStickers(ctx context.Context, in *mtproto.TLMessagesGetMyStickers) (*mtproto.Messages_MyStickers, error) {
++	r := &mtproto.Messages_MyStickers{Sets: []*mtproto.StickerSetCovered{}}
++	if vsDB == nil {
++		return mtproto.MakeTLMessagesMyStickers(r).To_Messages_MyStickers(), nil
++	}
++	me := s.me(ctx)
++	sets := vsScanSets(vsDB.QueryContext(ctx, "select "+vsSetCols+" from vs_sticker_sets where deleted = 0 and creator_id = ? order by created_at desc", me))
++	r.Count = int32(len(sets))
++	us := vsUserSets(ctx, me)
++	skip := in.GetOffsetId() != 0
++	for _, set := range sets {
++		if skip {
++			if set.id == in.GetOffsetId() {
++				skip = false
++			}
++			continue
++		}
++		r.Sets = append(r.Sets, vsCovered(ctx, set, us[set.id], me, false))
++		if in.GetLimit() > 0 && len(r.Sets) >= int(in.GetLimit()) {
++			break
++		}
++	}
++	return mtproto.MakeTLMessagesMyStickers(r).To_Messages_MyStickers(), nil
++}
++
++// --- свои наборы (stickers.*) ---
++
++func (s vsStickers) ownSet(ctx context.Context, in *mtproto.InputStickerSet) (*vsSet, error) {
++	set, err := vsResolveSet(ctx, in)
++	if err != nil {
++		return nil, err
++	}
++	if set.creator == 0 || set.creator != s.me(ctx) {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	return set, nil
++}
++
++// ownSetByDoc — свой набор, в котором лежит этот стикер.
++func (s vsStickers) ownSetByDoc(ctx context.Context, docId int64) (*vsSet, error) {
++	var setId int64
++	err := vsDB.QueryRowContext(ctx, "select i.set_id from vs_sticker_set_items i join vs_sticker_sets s on s.set_id = i.set_id "+
++		"where i.document_id = ? and s.creator_id = ? and s.deleted = 0 limit 1", docId, s.me(ctx)).Scan(&setId)
++	if err != nil {
++		return nil, errVsStickerInvalid
++	}
++	return vsGetSetById(ctx, setId), nil
++}
++
++func (s vsStickers) result(ctx context.Context, set *vsSet) (*mtproto.Messages_StickerSet, error) {
++	if set == nil {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	set = vsGetSetById(ctx, set.id)
++	if set == nil {
++		return nil, mtproto.ErrStickersetInvalid
++	}
++	me := s.me(ctx)
++	vsNotifyMe(ctx, vsUpdStickerSets())
++	return vsFullSet(ctx, set, vsUserSets(ctx, me)[set.id], me), nil
++}
++
++func (s vsStickers) addItem(ctx context.Context, set *vsSet, item *mtproto.InputStickerSetItem, pos int) error {
++	docId := item.GetDocument().GetId()
++	d := vsDoc(ctx, docId)
++	if d == nil || !vsCheckDocMime(d) {
++		return errVsStickerInvalid
++	}
++	emoji := strings.TrimSpace(item.GetEmoji())
++	if emoji == "" || len(emoji) > 60 {
++		return errVsEmojiInvalid
++	}
++	if err := vsSetDocAttrs(ctx, docId, set, strings.Fields(emoji)[0]); err != nil {
++		return err
++	}
++	kw := ""
++	if item.GetKeywords() != nil {
++		kw = item.GetKeywords().GetValue()
++		if len(kw) > 250 {
++			kw = kw[:250]
++		}
++	}
++	_, err := vsDB.ExecContext(ctx, "insert into vs_sticker_set_items(set_id, document_id, emoji, keywords, pos) values (?, ?, ?, ?, ?) "+
++		"on duplicate key update emoji = values(emoji), keywords = values(keywords), pos = values(pos)", set.id, docId, emoji, kw, pos)
++	if err != nil {
++		return errVsInternal
++	}
++	return nil
++}
++
++func (s vsStickers) StickersCheckShortName(ctx context.Context, in *mtproto.TLStickersCheckShortName) (*mtproto.Bool, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	if !reVsShortName.MatchString(in.GetShortName()) {
++		return nil, errVsShortNameInvalid
++	}
++	if vsGetSetByShort(ctx, in.GetShortName()) != nil {
++		return nil, errVsShortNameOccupied
++	}
++	var n int
++	_ = vsDB.QueryRowContext(ctx, "select count(*) from vs_sticker_sets where short_name = ?", in.GetShortName()).Scan(&n)
++	if n > 0 {
++		return nil, errVsShortNameOccupied
++	}
++	return mtproto.BoolTrue, nil
++}
++
++func (s vsStickers) StickersSuggestShortName(ctx context.Context, in *mtproto.TLStickersSuggestShortName) (*mtproto.Stickers_SuggestedShortName, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	base := vsTranslit(in.GetTitle())
++	name := base
++	for i := 0; i < 20; i++ {
++		var n int
++		_ = vsDB.QueryRowContext(ctx, "select count(*) from vs_sticker_sets where short_name = ?", name).Scan(&n)
++		if n == 0 {
++			break
++		}
++		name = fmt.Sprintf("%s_%d", base, 100+rand.Intn(9900))
++	}
++	return mtproto.MakeTLStickersSuggestedShortName(&mtproto.Stickers_SuggestedShortName{ShortName: name}).To_Stickers_SuggestedShortName(), nil
++}
++
++func (s vsStickers) StickersCreateStickerSet(ctx context.Context, in *mtproto.TLStickersCreateStickerSet) (*mtproto.Messages_StickerSet, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	if in.GetMasks() || in.GetEmojis() {
++		return nil, mtproto.ErrEnterpriseIsBlocked
++	}
++	title := strings.TrimSpace(in.GetTitle())
++	if title == "" || len([]rune(title)) > 64 {
++		return nil, errVsTitleInvalid
++	}
++	if _, err := s.StickersCheckShortName(ctx, &mtproto.TLStickersCheckShortName{ShortName: in.GetShortName()}); err != nil {
++		return nil, err
++	}
++	items := in.GetStickers()
++	if len(items) == 0 {
++		return nil, mtproto.ErrStickersEmpty
++	}
++	if len(items) > vsstickers.MaxSetStickers {
++		return nil, errVsStickersTooMuch
++	}
++	first := vsDoc(ctx, items[0].GetDocument().GetId())
++	if first == nil || !vsCheckDocMime(first) {
++		return nil, errVsStickerInvalid
++	}
++	me := s.me(ctx)
++	set := &vsSet{
++		id:         rand.Int63n(1<<62) + 1<<40,
++		accessHash: rand.Int63(),
++		short:      in.GetShortName(),
++		title:      title,
++		creator:    me,
++		kind:       vsstickers.MimeKind(first.GetMimeType()),
++		created:    time.Now().Unix(),
++	}
++	_, err := vsDB.ExecContext(ctx, "insert into vs_sticker_sets(set_id, access_hash, short_name, title, creator_id, official, kind, featured, deleted, created_at) values (?, ?, ?, ?, ?, 0, ?, 0, 0, ?)",
++		set.id, set.accessHash, set.short, set.title, me, set.kind, set.created)
++	if err != nil {
++		logx.WithContext(ctx).Errorf("vs stickers create: %v", err)
++		return nil, errVsShortNameOccupied
++	}
++	for i, it := range items {
++		if err = s.addItem(ctx, set, it, i); err != nil {
++			_, _ = vsDB.ExecContext(ctx, "update vs_sticker_sets set deleted = 1 where set_id = ?", set.id)
++			return nil, err
++		}
++	}
++	vsInstall(ctx, me, set.id, false)
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersAddStickerToSet(ctx context.Context, in *mtproto.TLStickersAddStickerToSet) (*mtproto.Messages_StickerSet, error) {
++	set, err := s.ownSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	items := vsSetItems(ctx, set.id)
++	if len(items) >= vsstickers.MaxSetStickers {
++		return nil, errVsStickersTooMuch
++	}
++	if err = s.addItem(ctx, set, in.GetSticker(), len(items)); err != nil {
++		return nil, err
++	}
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) renumber(ctx context.Context, setId int64, ids []int64) {
++	for i, id := range ids {
++		_, _ = vsDB.ExecContext(ctx, "update vs_sticker_set_items set pos = ? where set_id = ? and document_id = ?", i, setId, id)
++	}
++}
++
++func (s vsStickers) StickersRemoveStickerFromSet(ctx context.Context, in *mtproto.TLStickersRemoveStickerFromSet) (*mtproto.Messages_StickerSet, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	docId := in.GetSticker().GetId()
++	set, err := s.ownSetByDoc(ctx, docId)
++	if err != nil {
++		return nil, err
++	}
++	_, _ = vsDB.ExecContext(ctx, "delete from vs_sticker_set_items where set_id = ? and document_id = ?", set.id, docId)
++	s.renumber(ctx, set.id, vsItemsDocIds(vsSetItems(ctx, set.id)))
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersChangeStickerPosition(ctx context.Context, in *mtproto.TLStickersChangeStickerPosition) (*mtproto.Messages_StickerSet, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	docId := in.GetSticker().GetId()
++	set, err := s.ownSetByDoc(ctx, docId)
++	if err != nil {
++		return nil, err
++	}
++	ids := vsItemsDocIds(vsSetItems(ctx, set.id))
++	var rest []int64
++	for _, id := range ids {
++		if id != docId {
++			rest = append(rest, id)
++		}
++	}
++	p := int(in.GetPosition())
++	if p < 0 {
++		p = 0
++	}
++	if p > len(rest) {
++		p = len(rest)
++	}
++	out := append([]int64{}, rest[:p]...)
++	out = append(out, docId)
++	out = append(out, rest[p:]...)
++	s.renumber(ctx, set.id, out)
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersChangeSticker(ctx context.Context, in *mtproto.TLStickersChangeSticker) (*mtproto.Messages_StickerSet, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	docId := in.GetSticker().GetId()
++	set, err := s.ownSetByDoc(ctx, docId)
++	if err != nil {
++		return nil, err
++	}
++	if in.GetEmoji() != nil {
++		e := strings.TrimSpace(in.GetEmoji().GetValue())
++		if e == "" {
++			return nil, errVsEmojiInvalid
++		}
++		_, _ = vsDB.ExecContext(ctx, "update vs_sticker_set_items set emoji = ? where set_id = ? and document_id = ?", e, set.id, docId)
++		if err = vsSetDocAttrs(ctx, docId, set, strings.Fields(e)[0]); err != nil {
++			return nil, err
++		}
++	}
++	if in.GetKeywords() != nil {
++		_, _ = vsDB.ExecContext(ctx, "update vs_sticker_set_items set keywords = ? where set_id = ? and document_id = ?", in.GetKeywords().GetValue(), set.id, docId)
++	}
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersReplaceSticker(ctx context.Context, in *mtproto.TLStickersReplaceSticker) (*mtproto.Messages_StickerSet, error) {
++	if vsDB == nil {
++		return nil, errVsInternal
++	}
++	oldId := in.GetSticker().GetId()
++	set, err := s.ownSetByDoc(ctx, oldId)
++	if err != nil {
++		return nil, err
++	}
++	pos := 0
++	_ = vsDB.QueryRowContext(ctx, "select pos from vs_sticker_set_items where set_id = ? and document_id = ?", set.id, oldId).Scan(&pos)
++	if err = s.addItem(ctx, set, in.GetNewSticker(), pos); err != nil {
++		return nil, err
++	}
++	_, _ = vsDB.ExecContext(ctx, "delete from vs_sticker_set_items where set_id = ? and document_id = ?", set.id, oldId)
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersRenameStickerSet(ctx context.Context, in *mtproto.TLStickersRenameStickerSet) (*mtproto.Messages_StickerSet, error) {
++	set, err := s.ownSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	title := strings.TrimSpace(in.GetTitle())
++	if title == "" || len([]rune(title)) > 64 {
++		return nil, errVsTitleInvalid
++	}
++	_, _ = vsDB.ExecContext(ctx, "update vs_sticker_sets set title = ? where set_id = ?", title, set.id)
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersSetStickerSetThumb(ctx context.Context, in *mtproto.TLStickersSetStickerSetThumb) (*mtproto.Messages_StickerSet, error) {
++	set, err := s.ownSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	thumb := in.GetThumb().GetId()
++	if in.GetThumbDocumentId() != nil {
++		thumb = in.GetThumbDocumentId().GetValue()
++	}
++	_, _ = vsDB.ExecContext(ctx, "update vs_sticker_sets set thumb_doc_id = ? where set_id = ?", thumb, set.id)
++	return s.result(ctx, set)
++}
++
++func (s vsStickers) StickersDeleteStickerSet(ctx context.Context, in *mtproto.TLStickersDeleteStickerSet) (*mtproto.Bool, error) {
++	set, err := s.ownSet(ctx, in.GetStickerset())
++	if err != nil {
++		return nil, err
++	}
++	// набор помечается удалённым (не стирается): стикеры в уже отправленных сообщениях остаются
++	_, _ = vsDB.ExecContext(ctx, "update vs_sticker_sets set deleted = 1 where set_id = ?", set.id)
++	_, _ = vsDB.ExecContext(ctx, "delete from vs_user_sticker_sets where set_id = ?", set.id)
++	vsNotifyMe(ctx, vsUpdStickerSets())
++	return mtproto.BoolTrue, nil
++}
++
++// ---------- RPCGifs ----------
++
++type vsGifs struct {
++	mtproto.UnimplementedRPCGifsServer
++}
++
++func (vsGifs) MessagesGetSavedGifs(ctx context.Context, in *mtproto.TLMessagesGetSavedGifs) (*mtproto.Messages_SavedGifs, error) {
++	r := &mtproto.Messages_SavedGifs{Gifs: []*mtproto.Document{}}
++	md := vsMD(ctx)
++	if vsDB == nil || md == nil {
++		return mtproto.MakeTLMessagesSavedGifs(r).To_Messages_SavedGifs(), nil
++	}
++	ids, _ := vsUserDocIds(ctx, md.UserId, vsstickers.ListGifs, vsstickers.MaxGifs)
++	docs := vsDocs(ctx, ids)
++	hashIds := make([]int64, 0, len(docs))
++	for _, d := range docs {
++		hashIds = append(hashIds, d.GetId())
++	}
++	r.Hash = vsstickers.HashIds(hashIds)
++	if in.GetHash() != 0 && in.GetHash() == r.Hash {
++		return mtproto.MakeTLMessagesSavedGifsNotModified(nil).To_Messages_SavedGifs(), nil
++	}
++	r.Gifs = docs
++	return mtproto.MakeTLMessagesSavedGifs(r).To_Messages_SavedGifs(), nil
++}
++
++func (vsGifs) MessagesSaveGif(ctx context.Context, in *mtproto.TLMessagesSaveGif) (*mtproto.Bool, error) {
++	md := vsMD(ctx)
++	if vsDB == nil || md == nil {
++		return mtproto.BoolTrue, nil
++	}
++	id := in.GetId().GetId()
++	if mtproto.FromBool(in.GetUnsave()) {
++		vsUserDocDel(ctx, md.UserId, vsstickers.ListGifs, id)
++	} else {
++		if vsDoc(ctx, id) == nil {
++			return nil, status.Error(mtproto.ErrBadRequest, "GIF_ID_INVALID")
++		}
++		vsUserDocAdd(ctx, md.UserId, vsstickers.ListGifs, id, vsstickers.MaxGifs)
++	}
++	vsNotifyMe(ctx, mtproto.MakeTLUpdateSavedGifs(&mtproto.Update{}).To_Update())
++	return mtproto.BoolTrue, nil
++}
+diff --git a/app/tools/vsstickers/main.go b/app/tools/vsstickers/main.go
+new file mode 100644
+index 0000000..b4b7011
+--- /dev/null
++++ b/app/tools/vsstickers/main.go
+@@ -0,0 +1,188 @@
++// VSети: установщик официальных наборов стикеров.
++// Берёт bundle (manifest.json + файлы), кладёт файлы в S3 (documents/<id>.dat),
++// заводит документы в таблице documents и наборы в vs_sticker_sets / vs_sticker_set_items.
++// Повторный запуск безопасен: id стикеров постоянные (от ключа файла), записи заменяются.
++//
++//	vsstickers -bundle /tmp/bundle -media ../etc2/media.yaml -dfs ../etc2/dfs.yaml
++package main
++
++import (
++	"bytes"
++	"context"
++	"database/sql"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"hash/fnv"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	_ "github.com/go-sql-driver/mysql"
++	"github.com/minio/minio-go/v7"
++	"github.com/minio/minio-go/v7/pkg/credentials"
++	"github.com/teamgram/teamgram-server/pkg/vsstickers"
++	"github.com/zeromicro/go-zero/core/conf"
++	"github.com/zeromicro/go-zero/core/jsonx"
++)
++
++type manifest struct {
++	Source string `json:"source"`
++	Sets   []struct {
++		ShortName string `json:"short_name"`
++		Title     string `json:"title"`
++		Stickers  []struct {
++			File  string `json:"file"`
++			Key   string `json:"key"`
++			Emoji string `json:"emoji"`
++			Mime  string `json:"mime"`
++			Size  int64  `json:"size"`
++		} `json:"stickers"`
++	} `json:"sets"`
++}
++
++type mediaConf struct {
++	Mysql struct {
++		DSN string
++	}
++}
++
++type dfsConf struct {
++	Minio struct {
++		Endpoint        string
++		AccessKeyID     string
++		SecretAccessKey string
++		UseSSL          bool `json:",optional"`
++		Bucket          struct {
++			Documents string `json:",default=documents"`
++		} `json:",optional"`
++	}
++}
++
++type item struct {
++	id    int64
++	emoji string
++}
++
++const AnimatedEmojiShortName = "VSetiAnimatedEmoji"
++
++func docId(key string) int64 {
++	h := fnv.New64a()
++	_, _ = h.Write([]byte(key))
++	return vsstickers.OfficialDocIdBase + int64(h.Sum64()&0xffffffff)
++}
++
++func setAccessHash(setId int64) int64 {
++	h := fnv.New64a()
++	_, _ = fmt.Fprintf(h, "vseti-set-%d", setId)
++	return int64(h.Sum64() & 0x7fffffffffffffff)
++}
++
++func must(err error, what string) {
++	if err != nil {
++		fmt.Fprintf(os.Stderr, "ОШИБКА %s: %v\n", what, err)
++		os.Exit(1)
++	}
++}
++
++func main() {
++	bundle := flag.String("bundle", "bundle", "папка с manifest.json")
++	mediaPath := flag.String("media", "../etc2/media.yaml", "конфиг media (Mysql)")
++	dfsPath := flag.String("dfs", "../etc2/dfs.yaml", "конфиг dfs (Minio)")
++	flag.Parse()
++
++	var mc mediaConf
++	conf.MustLoad(*mediaPath, &mc)
++	var dc dfsConf
++	conf.MustLoad(*dfsPath, &dc)
++
++	raw, err := os.ReadFile(filepath.Join(*bundle, "manifest.json"))
++	must(err, "manifest")
++	var man manifest
++	must(json.Unmarshal(raw, &man), "manifest json")
++
++	ctx := context.Background()
++	db, err := sql.Open("mysql", mc.Mysql.DSN)
++	must(err, "mysql")
++	must(db.PingContext(ctx), "mysql ping")
++	for _, q := range vsstickers.Schema {
++		_, err = db.ExecContext(ctx, q)
++		must(err, "schema")
++	}
++
++	mi, err := minio.New(dc.Minio.Endpoint, &minio.Options{
++		Creds:  credentials.NewStaticV4(dc.Minio.AccessKeyID, dc.Minio.SecretAccessKey, ""),
++		Secure: dc.Minio.UseSSL,
++	})
++	must(err, "s3")
++	bucket := dc.Minio.Bucket.Documents
++	if bucket == "" {
++		bucket = "documents"
++	}
++
++	now := time.Now().Unix()
++	var allItems []item
++	uploaded, skipped := 0, 0
++	for n, s := range man.Sets {
++		setId := vsstickers.OfficialSetIdBase + int64(n+1)
++		hash := setAccessHash(setId)
++		var items []item
++		kind := vsstickers.KindStatic
++		for _, st := range s.Stickers {
++			id := docId(st.Key)
++			kind = vsstickers.MimeKind(st.Mime)
++			data, err := os.ReadFile(filepath.Join(*bundle, st.File))
++			must(err, "файл "+st.File)
++			path := fmt.Sprintf("%d.dat", id)
++			if info, err := mi.StatObject(ctx, bucket, path, minio.StatObjectOptions{}); err == nil && info.Size == int64(len(data)) {
++				skipped++
++			} else {
++				_, err = mi.PutObject(ctx, bucket, path, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{
++					ContentType: st.Mime, SendContentMd5: true,
++				})
++				must(err, "s3 put "+path)
++				uploaded++
++			}
++			attrs := vsstickers.StickerAttrs(st.Mime, st.Emoji, setId, hash, 512, 512, nil)
++			js, err := jsonx.MarshalToString(attrs)
++			must(err, "attrs")
++			ext := filepath.Ext(st.File)
++			_, err = db.ExecContext(ctx, "delete from documents where document_id = ?", id)
++			must(err, "documents delete")
++			_, err = db.ExecContext(ctx, "insert into documents(document_id, access_hash, dc_id, file_path, file_size, uploaded_file_name, ext, mime_type, thumb_id, video_thumb_id, attributes, date2) values (?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
++				id, int64(vsstickers.StorageType(st.Mime))<<32|(id&0xffffffff), path, len(data), filepath.Base(st.File), ext, st.Mime, js, now)
++			must(err, "documents insert")
++			items = append(items, item{id, st.Emoji})
++		}
++		saveSet(ctx, db, setId, hash, s.ShortName, s.Title, 1, kind, n+1, items, now)
++		allItems = append(allItems, items...)
++		fmt.Printf("набор %s «%s»: %d стикеров\n", s.ShortName, s.Title, len(items))
++	}
++	// Большие анимированные смайлы (inputStickerSetAnimatedEmoji): все стикеры, служебный набор.
++	aeId := vsstickers.OfficialSetIdBase + 0xFFFF
++	saveSet(ctx, db, aeId, setAccessHash(aeId), AnimatedEmojiShortName, "Animated Emoji", 2, vsstickers.KindAnimated, 0, allItems, now)
++	fmt.Printf("анимированные смайлы: %d\nфайлов загружено %d, уже были %d\nИсточник: %s\nГОТОВО\n", len(allItems), uploaded, skipped, man.Source)
++}
++
++func saveSet(ctx context.Context, db *sql.DB, setId, hash int64, short, title string, official, kind, featured int, items []item, now int64) {
++	_, err := db.ExecContext(ctx, "insert into vs_sticker_sets(set_id, access_hash, short_name, title, creator_id, official, kind, featured, deleted, created_at) values (?, ?, ?, ?, 0, ?, ?, ?, 0, ?) "+
++		"on duplicate key update access_hash=values(access_hash), short_name=values(short_name), title=values(title), official=values(official), kind=values(kind), featured=values(featured), deleted=0",
++		setId, hash, short, title, official, kind, featured, now)
++	must(err, "vs_sticker_sets "+short)
++	_, err = db.ExecContext(ctx, "delete from vs_sticker_set_items where set_id = ?", setId)
++	must(err, "items delete")
++	var sb strings.Builder
++	args := []any{}
++	for i, it := range items {
++		if i > 0 {
++			sb.WriteString(",")
++		}
++		sb.WriteString("(?, ?, ?, ?)")
++		args = append(args, setId, it.id, it.emoji, i)
++	}
++	if len(args) > 0 {
++		_, err = db.ExecContext(ctx, "insert into vs_sticker_set_items(set_id, document_id, emoji, pos) values "+sb.String(), args...)
++		must(err, "items insert")
++	}
++}
+diff --git a/pkg/vsstickers/vsstickers.go b/pkg/vsstickers/vsstickers.go
+new file mode 100644
+index 0000000..c838d22
+--- /dev/null
++++ b/pkg/vsstickers/vsstickers.go
+@@ -0,0 +1,157 @@
++// Package vsstickers — VSети: общие части стикеров (схема таблиц, id, атрибуты документов).
++// Используется bff (наборы, недавние, избранные, GIF) и установщиком наборов cmd vsstickers.
++package vsstickers
++
++import (
++	"github.com/teamgram/proto/mtproto"
++)
++
++// Диапазоны id VSети (не пересекаются с idgen Teamgram и с реакциями 0x5653…).
++const (
++	OfficialSetIdBase = int64(0x5654000000000000) // + номер набора
++	OfficialDocIdBase = int64(0x5655000000000000) // + номер стикера
++)
++
++// Виды набора (vs_sticker_sets.kind).
++const (
++	KindStatic   = 0 // webp
++	KindAnimated = 1 // tgs (Lottie)
++	KindVideo    = 2 // webm
++)
++
++// Списки документов пользователя (vs_user_docs.list).
++const (
++	ListRecent         = 1
++	ListRecentAttached = 2
++	ListFaved          = 3
++	ListGifs           = 4
++)
++
++// Лимиты как у Telegram (для бесплатных аккаунтов у нас всё доступно).
++const (
++	MaxSetStickers = 120
++	MaxRecent      = 20
++	MaxFaved       = 5
++	MaxGifs        = 200
++)
++
++// Schema — таблицы VSети. Создаются bff при старте и установщиком (IF NOT EXISTS).
++var Schema = []string{
++	"CREATE TABLE IF NOT EXISTS `vs_sticker_sets` (" +
++		"`set_id` bigint NOT NULL, `access_hash` bigint NOT NULL, " +
++		"`short_name` varchar(64) NOT NULL, `title` varchar(128) NOT NULL, " +
++		"`creator_id` bigint NOT NULL DEFAULT 0, `official` tinyint NOT NULL DEFAULT 0, " +
++		"`kind` tinyint NOT NULL DEFAULT 0, `emojis` tinyint NOT NULL DEFAULT 0, " +
++		"`thumb_doc_id` bigint NOT NULL DEFAULT 0, `featured` int NOT NULL DEFAULT 0, " +
++		"`deleted` tinyint NOT NULL DEFAULT 0, `created_at` int NOT NULL DEFAULT 0, " +
++		"PRIMARY KEY (`set_id`), UNIQUE KEY `short_name` (`short_name`), KEY `creator_id` (`creator_id`)" +
++		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
++	"CREATE TABLE IF NOT EXISTS `vs_sticker_set_items` (" +
++		"`set_id` bigint NOT NULL, `document_id` bigint NOT NULL, " +
++		"`emoji` varchar(64) NOT NULL DEFAULT '', `keywords` varchar(255) NOT NULL DEFAULT '', " +
++		"`pos` int NOT NULL DEFAULT 0, " +
++		"PRIMARY KEY (`set_id`, `document_id`), KEY `document_id` (`document_id`)" +
++		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
++	"CREATE TABLE IF NOT EXISTS `vs_user_sticker_sets` (" +
++		"`user_id` bigint NOT NULL, `set_id` bigint NOT NULL, `pos` int NOT NULL DEFAULT 0, " +
++		"`archived` tinyint NOT NULL DEFAULT 0, `installed_at` int NOT NULL DEFAULT 0, " +
++		"PRIMARY KEY (`user_id`, `set_id`)" +
++		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
++	"CREATE TABLE IF NOT EXISTS `vs_user_sticker_state` (" +
++		"`user_id` bigint NOT NULL, `defaults_done` int NOT NULL DEFAULT 0, `featured_read` int NOT NULL DEFAULT 0, " +
++		"PRIMARY KEY (`user_id`)" +
++		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
++	"CREATE TABLE IF NOT EXISTS `vs_user_docs` (" +
++		"`user_id` bigint NOT NULL, `list` tinyint NOT NULL, `document_id` bigint NOT NULL, " +
++		"`date` int NOT NULL DEFAULT 0, " +
++		"PRIMARY KEY (`user_id`, `list`, `document_id`), KEY `user_list_date` (`user_id`, `list`, `date`)" +
++		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
++}
++
++// CalcHash — хэш Telegram для списков (клиенты считают так же).
++func CalcHash(acc int64, v int64) int64 {
++	u := uint64(acc)
++	u ^= u >> 21
++	u ^= u << 35
++	u ^= u >> 4
++	u += uint64(v)
++	return int64(u)
++}
++
++func HashIds(ids []int64) int64 {
++	var h int64
++	for _, id := range ids {
++		h = CalcHash(h, id)
++	}
++	return h
++}
++
++// SetHash — hash:int набора (по документам).
++func SetHash(docIds []int64) int32 {
++	return int32(HashIds(docIds))
++}
++
++// MimeKind — вид набора по типу файла.
++func MimeKind(mime string) int {
++	switch mime {
++	case "application/x-tgsticker":
++		return KindAnimated
++	case "video/webm":
++		return KindVideo
++	}
++	return KindStatic
++}
++
++// StickerAttrs — атрибуты документа-стикера (как у Telegram).
++func StickerAttrs(mime, alt string, setId, setHash int64, w, h int32, keep []*mtproto.DocumentAttribute) []*mtproto.DocumentAttribute {
++	var set *mtproto.InputStickerSet
++	if setId != 0 {
++		set = mtproto.MakeTLInputStickerSetID(&mtproto.InputStickerSet{Id: setId, AccessHash: setHash}).To_InputStickerSet()
++	} else {
++		set = mtproto.MakeTLInputStickerSetEmpty(nil).To_InputStickerSet()
++	}
++	attrs := []*mtproto.DocumentAttribute{}
++	hasSize, hasName := false, false
++	for _, a := range keep {
++		switch a.GetPredicateName() {
++		case mtproto.Predicate_documentAttributeSticker, mtproto.Predicate_documentAttributeCustomEmoji:
++			continue
++		case mtproto.Predicate_documentAttributeImageSize:
++			hasSize = true
++		case mtproto.Predicate_documentAttributeVideo:
++			hasSize = true
++		case mtproto.Predicate_documentAttributeFilename:
++			hasName = true
++		}
++		attrs = append(attrs, a)
++	}
++	if !hasSize && w > 0 {
++		attrs = append(attrs, mtproto.MakeTLDocumentAttributeImageSize(&mtproto.DocumentAttribute{W: w, H: h}).To_DocumentAttribute())
++	}
++	attrs = append(attrs, mtproto.MakeTLDocumentAttributeSticker(&mtproto.DocumentAttribute{
++		Alt:        alt,
++		Stickerset: set,
++	}).To_DocumentAttribute())
++	if !hasName {
++		name := "sticker.webp"
++		switch mime {
++		case "application/x-tgsticker":
++			name = "AnimatedSticker.tgs"
++		case "video/webm":
++			name = "sticker.webm"
++		}
++		attrs = append(attrs, mtproto.MakeTLDocumentAttributeFilename(&mtproto.DocumentAttribute{FileName: name}).To_DocumentAttribute())
++	}
++	return attrs
++}
++
++// StorageType — старшие 32 бита access_hash документа (тип файла для upload.file).
++func StorageType(mime string) int32 {
++	switch mime {
++	case "image/webp":
++		return int32(mtproto.TLConstructor_CRC32_storage_fileWebp)
++	case "video/webm", "video/mp4":
++		return int32(mtproto.TLConstructor_CRC32_storage_fileMp4)
++	}
++	return int32(mtproto.TLConstructor_CRC32_storage_fileUnknown)
++}
