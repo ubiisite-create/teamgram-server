@@ -1,6 +1,7 @@
 # VSети: наборы стикеров из Noto Animated Emoji (Google, CC BY 4.0).
 # Скачивает Lottie, приводит к формату .tgs (512x512), пишет bundle/manifest.json и bundle/files/*.tgs
 import gzip, json, os, sys, urllib.request, concurrent.futures as cf
+from rlottie_python import LottieAnimation
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else 'bundle'
 API = 'https://googlefonts.github.io/noto-emoji-animation/data/api.json'
@@ -50,6 +51,7 @@ SETS = [
     ('VSetiThings', 'VSети: Вещи и символы', by.get('Objects', []) + by.get('Symbols', []) + by.get('Flags', [])),
 ]
 os.makedirs(os.path.join(OUT, 'files'), exist_ok=True)
+os.makedirs(os.path.join(OUT, 'thumbs'), exist_ok=True)
 allcp = [cp for _, _, l in SETS for cp in l]
 
 def fetch(cp):
@@ -58,17 +60,26 @@ def fetch(cp):
     except Exception as e:
         print('skip', cp, e, file=sys.stderr)
         return cp, 0
-    with open(os.path.join(OUT, 'files', cp + '.tgs'), 'wb') as f:
+    path = os.path.join(OUT, 'files', cp + '.tgs')
+    with open(path, 'wb') as f:
         f.write(data)
     return cp, len(data)
+
+def thumb(cp):
+    # превью 128x128 (первый кадр), как у Telegram: без него Android показывает стикер файлом
+    im = LottieAnimation.from_tgs(os.path.join(OUT, 'files', cp + '.tgs')).render_pillow_frame(frame_num=0, width=128, height=128)
+    im.save(os.path.join(OUT, 'thumbs', cp + '.webp'), 'WEBP', quality=80)
 
 sizes = {}
 with cf.ThreadPoolExecutor(16) as ex:
     for cp, n in ex.map(fetch, allcp):
         sizes[cp] = n
+for cp, n in sizes.items():
+    if n:
+        thumb(cp)
 man = {'source': 'Noto Animated Emoji (Google), CC BY 4.0', 'sets': []}
 for short, title, l in SETS:
     man['sets'].append({'short_name': short, 'title': title, 'stickers': [
-        {'file': 'files/%s.tgs' % cp, 'key': cp, 'emoji': emoji(cp), 'mime': 'application/x-tgsticker', 'size': sizes[cp]} for cp in [c for c in l if sizes.get(c)][:120]]})
+        {'file': 'files/%s.tgs' % cp, 'key': cp, 'emoji': emoji(cp), 'mime': 'application/x-tgsticker', 'size': sizes[cp], 'thumb': 'thumbs/%s.webp' % cp} for cp in [c for c in l if sizes.get(c)][:120]]})
 json.dump(man, open(os.path.join(OUT, 'manifest.json'), 'w'), ensure_ascii=False, indent=1)
 print('sets', [(s['short_name'], len(s['stickers'])) for s in man['sets']], 'bytes', sum(sizes.values()))
