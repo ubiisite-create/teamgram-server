@@ -1,0 +1,155 @@
+diff --git a/mtproto/mutable_chat_helper.go b/mtproto/mutable_chat_helper.go
+index 633fe01..954a5b2 100644
+--- a/mtproto/mutable_chat_helper.go
++++ b/mtproto/mutable_chat_helper.go
+@@ -75,7 +75,7 @@ func (m *MutableChat) Call() *InputGroupCall {
+ }
+ 
+ func (m *MutableChat) AvailableReactions() *ChatReactions {
+-	return FromChatReactions(m.GetChat().GetAvailableReactionsType(), m.GetChat().GetAvailableReactions())
++	return FromChatReactions(m.GetChat().GetAvailableReactionsType()%100, m.GetChat().GetAvailableReactions())
+ }
+ 
+ func (m *MutableChat) ParticipantIdList() []int64 {
+@@ -133,6 +133,9 @@ func (m *MutableChat) MakeMessageService(fromId int64, action *MessageAction) *M
+ }
+ 
+ func (m *MutableChat) ToUnsafeChat(id int64) *Chat {
++	if m.IsVsChannel() {
++		return m.toVsChannel(id)
++	}
+ 	var (
+ 		ok bool
+ 		me *ImmutableChatParticipant
+diff --git a/mtproto/vseti_channel.go b/mtproto/vseti_channel.go
+new file mode 100644
+index 0000000..576df9d
+--- /dev/null
++++ b/mtproto/vseti_channel.go
+@@ -0,0 +1,126 @@
++package mtproto
++
++import (
++	"sync"
++	"time"
++)
++
++// VSети: каналы и супергруппы поверх обычных групп Teamgram.
++// Признак — chats.available_reactions_type: +100 супергруппа, +200 канал
++// (реакции в бесплатном Teamgram не используются; остаток %100 — настоящий тип реакций).
++const (
++	VsKindMegagroup = int32(100)
++	VsKindBroadcast = int32(200)
++	// Префикс названия, по которому biz chat.createChat2 создаёт канал (и отрезает его).
++	VsTitlePrefixMegagroup = "\u0001VSMG\u0001"
++	VsTitlePrefixBroadcast = "\u0001VSBC\u0001"
++)
++
++func VsKind(reactionsType int32) int32 { return (reactionsType / 100) * 100 }
++func (m *MutableChat) IsVsChannel() bool   { return VsKind(m.GetChat().GetAvailableReactionsType()) >= VsKindMegagroup }
++func (m *MutableChat) IsVsBroadcast() bool { return VsKind(m.GetChat().GetAvailableReactionsType()) == VsKindBroadcast }
++func (m *MutableChat) IsVsMegagroup() bool { return VsKind(m.GetChat().GetAvailableReactionsType()) == VsKindMegagroup }
++
++// VsChannelAccessHash — детерминированный access_hash (сервер его не проверяет).
++func VsChannelAccessHash(id int64) int64 { return id*2654435761 ^ 0x5653657469 }
++
++// VsChannelUsernameFunc — подставляется сервисом, чтобы ToUnsafeChat знал @username канала.
++var VsChannelUsernameFunc func(id int64) string
++
++func (m *MutableChat) toVsChannel(id int64) *Chat {
++	ch := &Chat{
++		Id:                          m.Id(),
++		AccessHash_FLAGINT64:        MakeFlagsInt64(VsChannelAccessHash(m.Id())),
++		Title:                       m.Title(),
++		Photo:                       MakeChatPhotoByPhoto(m.Chat.Photo),
++		Date:                        m.Date(),
++		Broadcast:                   m.IsVsBroadcast(),
++		Megagroup:                   m.IsVsMegagroup(),
++		ParticipantsCount_FLAGINT32: MakeFlagsInt32(m.ParticipantsCount()),
++		Noforwards:                  m.Noforwards(),
++		CallActive:                  m.CallActive(),
++		CallNotEmpty:                m.CallNotEmpty(),
++	}
++	if VsChannelUsernameFunc != nil {
++		if u := VsChannelUsernameFunc(m.Id()); u != "" {
++			ch.Username = MakeFlagsString(u)
++		}
++	}
++	if m.Deactivated() {
++		return MakeTLChannelForbidden(ch).To_Chat()
++	}
++	me, ok := m.GetImmutableChatParticipant(id)
++	if !ok || me.IsChatMemberStateLeft() {
++		ch.Left = true
++		if ch.Broadcast {
++			ch.DefaultBannedRights = m.DefaultBannedRights()
++		}
++		return MakeTLChannel(ch).To_Chat()
++	}
++	if me.IsChatMemberStateKicked() {
++		return MakeTLChannelForbidden(ch).To_Chat()
++	}
++	ch.Creator = me.IsChatMemberCreator()
++	if ch.Creator {
++		ch.AdminRights = VsFullAdminRights(ch.Broadcast)
++	} else if me.GetAdminRights() != nil {
++		ch.AdminRights = me.GetAdminRights()
++	}
++	if ch.Megagroup {
++		ch.DefaultBannedRights = m.DefaultBannedRights()
++	}
++	return MakeTLChannel(ch).To_Chat()
++}
++
++func VsFullAdminRights(broadcast bool) *ChatAdminRights {
++	r := &ChatAdminRights{
++		ChangeInfo:     true,
++		DeleteMessages: true,
++		BanUsers:       true,
++		InviteUsers:    true,
++		PinMessages:    true,
++		AddAdmins:      true,
++		ManageCall:     true,
++		Other:          true,
++	}
++	if broadcast {
++		r.PostMessages = true
++		r.EditMessages = true
++	}
++	return MakeTLChatAdminRights(r).To_ChatAdminRights()
++}
++
++// --- @username каналов: кэш в процессе ---
++
++var (
++	vsUnameMu    sync.RWMutex
++	vsUnameCache = map[int64]vsUname{}
++)
++
++type vsUname struct {
++	name string
++	at   time.Time
++}
++
++// VsSetChannelUsernameFetcher — откуда брать @username канала (user-сервис).
++func VsSetChannelUsernameFetcher(fetch func(id int64) string) {
++	VsChannelUsernameFunc = func(id int64) string {
++		vsUnameMu.RLock()
++		it, ok := vsUnameCache[id]
++		vsUnameMu.RUnlock()
++		if ok && time.Since(it.at) < time.Minute {
++			return it.name
++		}
++		n := fetch(id)
++		vsUnameMu.Lock()
++		vsUnameCache[id] = vsUname{name: n, at: time.Now()}
++		vsUnameMu.Unlock()
++		return n
++	}
++}
++
++func VsForgetChannelUsername(id int64) {
++	vsUnameMu.Lock()
++	delete(vsUnameCache, id)
++	vsUnameMu.Unlock()
++}
