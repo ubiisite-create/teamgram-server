@@ -1,0 +1,24 @@
+diff --git a/app/tools/vsstickers/main.go b/app/tools/vsstickers/main.go
+index 31d778c..1768d1a 100644
+--- a/app/tools/vsstickers/main.go
++++ b/app/tools/vsstickers/main.go
+@@ -233,8 +233,8 @@ func ensureGifBot(ctx context.Context, db *sql.DB, rds []*redis.Redis) {
+ 	err := db.QueryRowContext(ctx, "select username from users where id = ?", id).Scan(&name)
+ 	switch {
+ 	case err == sql.ErrNoRows:
+-		_, err = db.ExecContext(ctx, "insert into users(id, user_type, access_hash, first_name, last_name, username, phone, country_code, is_bot, about) values (?, 3, ?, 'GIF', '', ?, '', '', 1, ?)",
+-			id, setAccessHash(id), vsstickers.GifBotUsername, "Поиск GIF в VSети")
++		_, err = db.ExecContext(ctx, "insert into users(id, user_type, access_hash, first_name, last_name, username, phone, country_code, is_bot, about) values (?, 3, ?, 'GIF', '', ?, ?, '', 1, ?)",
++			id, setAccessHash(id), vsstickers.GifBotUsername, fmt.Sprintf("vsbot%d", id), "Поиск GIF в VSети")
+ 		must(err, "users @gif")
+ 	case err != nil:
+ 		must(err, "users @gif select")
+@@ -245,7 +245,7 @@ func ensureGifBot(ctx context.Context, db *sql.DB, rds []*redis.Redis) {
+ 	var n int
+ 	_ = db.QueryRowContext(ctx, "select count(*) from bots where bot_id = ?", id).Scan(&n)
+ 	if n == 0 {
+-		_, err = db.ExecContext(ctx, "insert into bots(bot_id, bot_type, creator_user_id, bot_nochats, bot_inline_placeholder) values (?, 1, 0, 1, ?)", id, vsstickers.GifBotPlaceholder)
++		_, err = db.ExecContext(ctx, "insert into bots(bot_id, bot_type, creator_user_id, token, bot_nochats, bot_inline_placeholder) values (?, 1, 0, ?, 1, ?)", id, fmt.Sprintf("vsbot%d", id), vsstickers.GifBotPlaceholder)
+ 		must(err, "bots @gif")
+ 	} else {
+ 		_, _ = db.ExecContext(ctx, "update bots set bot_inline_placeholder = ? where bot_id = ?", vsstickers.GifBotPlaceholder, id)
