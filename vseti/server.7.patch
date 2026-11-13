@@ -1,0 +1,89 @@
+diff --git a/pkg/vswebpage/vswebpage.go b/pkg/vswebpage/vswebpage.go
+index fd01f4c..be0a24a 100644
+--- a/pkg/vswebpage/vswebpage.go
++++ b/pkg/vswebpage/vswebpage.go
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"crypto/md5"
+ 	"encoding/hex"
++	"encoding/json"
+ 	"hash/fnv"
+ 	"html"
+ 	"io"
+@@ -197,9 +198,62 @@ func Preview(ctx context.Context, rawUrl string) (*mtproto.WebPage, error) {
+ 	return wp, nil
+ }
+ 
++var reYtId = regexp.MustCompile(`(?:youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|embed/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})`)
++
++// vsYouTube — YouTube из России напрямую недоступен: название берём через noembed.com,
++// обложку — через прокси картинок wsrv.nl.
++func vsYouTube(ctx context.Context, u, id string) *mtproto.WebPage {
++	var title, author string
++	if b, _, err := vsGet(ctx, "https://noembed.com/embed?url="+url.QueryEscape("https://www.youtube.com/watch?v="+id), 256*1024); err == nil {
++		var j struct {
++			Title      string `json:"title"`
++			AuthorName string `json:"author_name"`
++		}
++		if json.Unmarshal(b, &j) == nil {
++			title, author = j.Title, j.AuthorName
++		}
++	}
++	if title == "" {
++		return nil
++	}
++	h := fnv.New64a()
++	h.Write([]byte(u))
++	wid := int64(h.Sum64() & 0x7fffffffffffffff)
++	wp := &mtproto.WebPage{
++		Id:            wid,
++		Url_STRING:    u,
++		DisplayUrl:    strings.TrimPrefix(strings.TrimPrefix(u, "https://"), "http://"),
++		Hash:          int32(wid),
++		Type:          wrapperspb.String("video"),
++		SiteName:      wrapperspb.String("YouTube"),
++		Title:         wrapperspb.String(vsCut(title, 256)),
++		EmbedUrl:      wrapperspb.String("https://www.youtube.com/embed/" + id),
++		EmbedType:     wrapperspb.String("iframe"),
++		EmbedWidth:    wrapperspb.Int32(1280),
++		EmbedHeight:   wrapperspb.Int32(720),
++		HasLargeMedia: true,
++		Attributes:    []*mtproto.WebPageAttribute{},
++	}
++	if author != "" {
++		wp.Description = wrapperspb.String(vsCut(author, 256))
++		wp.Author = wrapperspb.String(vsCut(author, 128))
++	}
++	for _, q := range []string{"maxresdefault", "hqdefault"} {
++		img := "https://wsrv.nl/?url=i.ytimg.com/vi/" + id + "/" + q + ".jpg"
++		if data, ct, err := vsGet(ctx, img, 5*1024*1024); err == nil && strings.HasPrefix(ct, "image/") && len(data) > 2000 {
++			wp.Photo = vsUploadPhoto(ctx, data)
++			break
++		}
++	}
++	return mtproto.MakeTLWebPage(wp).To_WebPage()
++}
++
+ func vsBuild(ctx context.Context, u string, pu *url.URL) *mtproto.WebPage {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
+ 	defer cancel()
++	if m := reYtId.FindStringSubmatch(u); len(m) > 1 {
++		return vsYouTube(ctx, u, m[1])
++	}
+ 	body, ctype, err := vsGet(ctx, u, 2*1024*1024)
+ 	if err != nil {
+ 		logx.Infof("vs webpage: %s: %v", u, err)
+@@ -245,7 +299,12 @@ func vsBuild(ctx context.Context, u string, pu *url.URL) *mtproto.WebPage {
+ 	}
+ 	if img != "" {
+ 		if iu, err := pu.Parse(img); err == nil {
+-			if data, ct, err := vsGet(ctx, iu.String(), 5*1024*1024); err == nil && strings.HasPrefix(strings.ToLower(ct), "image/") && !bytes.HasPrefix(data, []byte("<")) {
++			data, ct, err := vsGet(ctx, iu.String(), 5*1024*1024)
++			if err != nil || !strings.HasPrefix(strings.ToLower(ct), "image/") {
++				// картинка с заблокированного адреса — через прокси картинок
++				data, ct, err = vsGet(ctx, "https://wsrv.nl/?url="+url.QueryEscape(iu.String()), 5*1024*1024)
++			}
++			if err == nil && strings.HasPrefix(strings.ToLower(ct), "image/") && !bytes.HasPrefix(data, []byte("<")) {
+ 				wp.Photo = vsUploadPhoto(ctx, data)
+ 			}
+ 		}
