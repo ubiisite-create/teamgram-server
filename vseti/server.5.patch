@@ -1,0 +1,51 @@
+diff --git a/app/bff/bff/internal/server/vs_gifsearch.go b/app/bff/bff/internal/server/vs_gifsearch.go
+index 5905bca..1d17452 100644
+--- a/app/bff/bff/internal/server/vs_gifsearch.go
++++ b/app/bff/bff/internal/server/vs_gifsearch.go
+@@ -44,6 +44,9 @@ func vsGifWords(parts ...string) []string {
+ 			if _, err := strconv.Atoi(w); err == nil {
+ 				continue // номера в именах файлов
+ 			}
++			if len(w) >= 12 && strings.Trim(w, "0123456789abcdef") == "" {
++				continue // хэши вместо имён файлов
++			}
+ 			seen[w] = true
+ 			r = append(r, w)
+ 		}
+diff --git a/app/tools/vsstickers/main.go b/app/tools/vsstickers/main.go
+index 2716cca..31d778c 100644
+--- a/app/tools/vsstickers/main.go
++++ b/app/tools/vsstickers/main.go
+@@ -256,11 +256,17 @@ func ensureGifBot(ctx context.Context, db *sql.DB, rds []*redis.Redis) {
+ 	case err == sql.ErrNoRows:
+ 		_, err = db.ExecContext(ctx, "insert into username(username, peer_type, peer_id) values (?, 2, ?)", vsstickers.GifBotUsername, id)
+ 		must(err, "username @gif")
++	case err == nil && peer == vsstickers.OldGifBotId:
++		// первая версия завела бота под id 777010, а Teamgram отдаёт @gif как id 101 — переносим
++		_, err = db.ExecContext(ctx, "update username set peer_id = ? where username = ? and peer_id = ?", id, vsstickers.GifBotUsername, vsstickers.OldGifBotId)
++		must(err, "username @gif move")
++		_, _ = db.ExecContext(ctx, "update users set username = '', deleted = 1, delete_reason = 'VSeti: gif bot moved to id 101' where id = ? and username = ?", vsstickers.OldGifBotId, vsstickers.GifBotUsername)
++		fmt.Println("бот @gif перенесён на id 101")
+ 	case err == nil && peer != id:
+ 		fmt.Printf("ВНИМАНИЕ: имя @gif уже занято (peer %d)\n", peer)
+ 	}
+ 	for _, r := range rds {
+-		_, _ = r.Del(fmt.Sprintf("user_%d", id), fmt.Sprintf("bots_%d", id))
++		_, _ = r.Del(fmt.Sprintf("user_data.2#%d", id), fmt.Sprintf("user_data.2#%d", vsstickers.OldGifBotId), "user_data#101")
+ 	}
+ 	fmt.Println("бот @gif готов")
+ }
+diff --git a/pkg/vsstickers/vsstickers.go b/pkg/vsstickers/vsstickers.go
+index 61de99a..6d2f4ae 100644
+--- a/pkg/vsstickers/vsstickers.go
++++ b/pkg/vsstickers/vsstickers.go
+@@ -159,7 +159,8 @@ func StorageType(mime string) int32 {
+ // ---------- GIF: служебный бот @gif и своя база гифок ----------
+ 
+ const (
+-	GifBotId          = int64(777010)
++	GifBotId          = int64(101) // зарезервирован в Teamgram под @gif (user.BotGifId)
++	OldGifBotId       = int64(777010)
+ 	GifBotUsername    = "gif"
+ 	GifBotPlaceholder = "Поиск GIF"
+ )
