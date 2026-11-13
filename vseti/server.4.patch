@@ -1,0 +1,351 @@
+diff --git a/app/bff/bff/internal/server/server.go b/app/bff/bff/internal/server/server.go
+index 7481adc..9c3514c 100644
+--- a/app/bff/bff/internal/server/server.go
++++ b/app/bff/bff/internal/server/server.go
+@@ -249,6 +249,7 @@ func (s *Server) Initialize() error {
+ 				SyncClient:    c.SyncClient,
+ 			}, nil)
+ 		mtproto.RegisterRPCMessagesServer(grpcServer, vsMessagesSvc)
++		vsMessagesRef = vsMessagesSvc
+ 
+ 		// notification_helper
+ 		mtproto.RegisterRPCNotificationServer(
+@@ -366,6 +367,7 @@ func (s *Server) Initialize() error {
+ 		mtproto.RegisterRPCWebPageServer(grpcServer, vsWebPage{})
+ 		mtproto.RegisterRPCStickersServer(grpcServer, vsStickers{})
+ 		mtproto.RegisterRPCGifsServer(grpcServer, vsGifs{})
++		mtproto.RegisterRPCInlineBotServer(grpcServer, vsInlineBot{})
+ 	})
+ 	initVsChannels(s.grpcSrv, c)
+ 	initVsStickers(c)
+diff --git a/app/bff/bff/internal/server/vs_channels.go b/app/bff/bff/internal/server/vs_channels.go
+index e5ef755..f864f3a 100644
+--- a/app/bff/bff/internal/server/vs_channels.go
++++ b/app/bff/bff/internal/server/vs_channels.go
+@@ -84,7 +84,7 @@ func initVsChannels(srv *zrpc.RpcServer, c config.Config) {
+ 			vschan.Default.RewriteOut(ctx, resp)
+ 			// VSети: отправленный стикер → «Недавние», GIF → сохранённые
+ 			if r, ok := req.(*mtproto.TLMessagesSendMedia); ok {
+-				go vsAfterSendMedia(context.WithoutCancel(ctx), r.GetMedia())
++				go vsAfterSendMedia(context.WithoutCancel(ctx), r.GetMessage(), resp)
+ 			}
+ 		}
+ 		return resp, err
+diff --git a/app/bff/bff/internal/server/vs_gifsearch.go b/app/bff/bff/internal/server/vs_gifsearch.go
+new file mode 100644
+index 0000000..5905bca
+--- /dev/null
++++ b/app/bff/bff/internal/server/vs_gifsearch.go
+@@ -0,0 +1,175 @@
++// VSети: поиск GIF через служебного бота @gif (как в Telegram: вкладка GIF → строка поиска → inline-бот @gif).
++// Бесплатно, без сторонних сервисов: ищем по своей базе — гифкам, которые отправляли в VSети
++// (слова из подписи и имени файла). Пустой запрос — самые популярные.
++package server
++
++import (
++	"context"
++	"math/rand"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++	"unicode"
++
++	"github.com/teamgram/proto/mtproto"
++	"github.com/teamgram/teamgram-server/pkg/vsstickers"
++
++	"github.com/zeromicro/go-zero/core/logx"
++	"google.golang.org/grpc/status"
++	"google.golang.org/protobuf/types/known/wrapperspb"
++)
++
++var vsMessagesRef interface {
++	MessagesSendMedia(ctx context.Context, in *mtproto.TLMessagesSendMedia) (*mtproto.Updates, error)
++}
++
++const vsGifPage = 50
++
++// vsGifWords — слова для поиска: подпись + имя файла, в нижнем регистре, без повторов.
++func vsGifWords(parts ...string) []string {
++	seen := map[string]bool{}
++	var r []string
++	for _, p := range parts {
++		for _, w := range strings.FieldsFunc(strings.ToLower(p), func(c rune) bool {
++			return !unicode.IsLetter(c) && !unicode.IsDigit(c)
++		}) {
++			if len([]rune(w)) < 2 || seen[w] {
++				continue
++			}
++			switch w {
++			case "mp4", "gif", "img", "vid", "video", "animation", "giphy", "tenor":
++				continue
++			}
++			if _, err := strconv.Atoi(w); err == nil {
++				continue // номера в именах файлов
++			}
++			seen[w] = true
++			r = append(r, w)
++		}
++	}
++	return r
++}
++
++func vsGifIndexAdd(ctx context.Context, d *mtproto.Document, caption string) {
++	name := ""
++	for _, a := range d.GetAttributes() {
++		if a.GetPredicateName() == mtproto.Predicate_documentAttributeFilename {
++			name = strings.TrimSuffix(a.GetFileName(), filepath.Ext(a.GetFileName()))
++		}
++	}
++	var old string
++	_ = vsDB.QueryRowContext(ctx, "select words from vs_gif_index where document_id = ?", d.GetId()).Scan(&old)
++	words := strings.Join(vsGifWords(old, caption, name), " ")
++	if len(words) > 500 {
++		words = words[:500]
++	}
++	_, err := vsDB.ExecContext(ctx, "insert into vs_gif_index(document_id, words, uses, last_used) values (?, ?, 1, ?) "+
++		"on duplicate key update words = values(words), uses = uses + 1, last_used = values(last_used)",
++		d.GetId(), words, time.Now().Unix())
++	if err != nil {
++		logx.WithContext(ctx).Errorf("vs gif index: %v", err)
++	}
++}
++
++func vsGifSearch(ctx context.Context, q string, offset, limit int) []int64 {
++	words := vsGifWords(q)
++	sqlq := "select document_id from vs_gif_index"
++	var args []any
++	if len(words) > 0 {
++		var conds []string
++		for _, w := range words {
++			conds = append(conds, "words like ?")
++			args = append(args, "%"+w+"%")
++		}
++		sqlq += " where " + strings.Join(conds, " and ")
++	}
++	sqlq += " order by uses desc, last_used desc limit ? offset ?"
++	args = append(args, limit, offset)
++	rows, err := vsDB.QueryContext(ctx, sqlq, args...)
++	if err != nil {
++		logx.WithContext(ctx).Errorf("vs gif search: %v", err)
++		return nil
++	}
++	defer rows.Close()
++	var ids []int64
++	for rows.Next() {
++		var id int64
++		if rows.Scan(&id) == nil {
++			ids = append(ids, id)
++		}
++	}
++	return ids
++}
++
++type vsInlineBot struct {
++	mtproto.UnimplementedRPCInlineBotServer
++}
++
++func (vsInlineBot) MessagesGetInlineBotResults(ctx context.Context, in *mtproto.TLMessagesGetInlineBotResults) (*mtproto.Messages_BotResults, error) {
++	if in.GetBot().GetUserId() != vsstickers.GifBotId {
++		return nil, status.Error(mtproto.ErrBadRequest, "BOT_INLINE_DISABLED")
++	}
++	r := &mtproto.Messages_BotResults{
++		Gallery:   true,
++		QueryId:   rand.Int63(),
++		Results:   []*mtproto.BotInlineResult{},
++		CacheTime: 30,
++		Users:     []*mtproto.User{},
++	}
++	if vsDB != nil {
++		offset, _ := strconv.Atoi(in.GetOffset())
++		ids := vsGifSearch(ctx, in.GetQuery(), offset, vsGifPage+1)
++		if len(ids) > vsGifPage {
++			ids = ids[:vsGifPage]
++			r.NextOffset = wrapperspb.String(strconv.Itoa(offset + vsGifPage))
++		}
++		for _, d := range vsDocs(ctx, ids) {
++			r.Results = append(r.Results, mtproto.MakeTLBotInlineMediaResult(&mtproto.BotInlineResult{
++				Id:       strconv.FormatInt(d.GetId(), 10),
++				Type:     "gif",
++				Document: d,
++				SendMessage: mtproto.MakeTLBotInlineMessageMediaAuto(&mtproto.BotInlineMessage{
++					Message: "",
++				}).To_BotInlineMessage(),
++			}).To_BotInlineResult())
++		}
++	}
++	return mtproto.MakeTLMessagesBotResults(r).To_Messages_BotResults(), nil
++}
++
++func (vsInlineBot) MessagesSendInlineBotResult(ctx context.Context, in *mtproto.TLMessagesSendInlineBotResult) (*mtproto.Updates, error) {
++	id, err := strconv.ParseInt(in.GetId(), 10, 64)
++	if err != nil || vsMessagesRef == nil {
++		return nil, status.Error(mtproto.ErrBadRequest, "RESULT_ID_INVALID")
++	}
++	d := vsDoc(ctx, id)
++	if d == nil || !vsDocIsGif(d) {
++		return nil, status.Error(mtproto.ErrBadRequest, "RESULT_ID_INVALID")
++	}
++	req := &mtproto.TLMessagesSendMedia{
++		Silent:       in.GetSilent(),
++		Background:   in.GetBackground(),
++		ClearDraft:   in.GetClearDraft(),
++		Peer:         in.GetPeer(),
++		ReplyTo:      in.GetReplyTo(),
++		ReplyToMsgId: in.GetReplyToMsgId(),
++		TopMsgId:     in.GetTopMsgId(),
++		Media: mtproto.MakeTLInputMediaDocument(&mtproto.InputMedia{
++			Id_INPUTDOCUMENT: mtproto.MakeTLInputDocument(&mtproto.InputDocument{
++				Id:            d.GetId(),
++				AccessHash:    d.GetAccessHash(),
++				FileReference: d.GetFileReference(),
++			}).To_InputDocument(),
++		}).To_InputMedia(),
++		Message:      "",
++		RandomId:     in.GetRandomId(),
++		ScheduleDate: in.GetScheduleDate(),
++		SendAs:       in.GetSendAs(),
++	}
++	resp, err := vsMessagesRef.MessagesSendMedia(ctx, req)
++	if err == nil && resp != nil {
++		go vsAfterSendMedia(context.WithoutCancel(ctx), "", resp)
++	}
++	return resp, err
++}
+diff --git a/app/bff/bff/internal/server/vs_stickers.go b/app/bff/bff/internal/server/vs_stickers.go
+index 2bdfb11..42c21ee 100644
+--- a/app/bff/bff/internal/server/vs_stickers.go
++++ b/app/bff/bff/internal/server/vs_stickers.go
+@@ -429,27 +429,36 @@ func vsUserDocDel(ctx context.Context, userId int64, list int, docId int64) {
+ 	_, _ = vsDB.ExecContext(ctx, "delete from vs_user_docs where user_id = ? and list = ? and document_id = ?", userId, list, docId)
+ }
+ 
+-// vsAfterSendMedia — как Telegram: отправленный стикер попадает в «Недавние», отправленная GIF — в сохранённые.
+-func vsAfterSendMedia(ctx context.Context, media *mtproto.InputMedia) {
+-	if vsDB == nil || media.GetPredicateName() != mtproto.Predicate_inputMediaDocument {
++// vsAfterSendMedia — как Telegram: отправленный стикер попадает в «Недавние», отправленная GIF — в сохранённые
++// и в базу поиска GIF (@gif). Документ берётся из ответа сервера — так ловятся и только что загруженные GIF.
++func vsAfterSendMedia(ctx context.Context, caption string, resp any) {
++	if vsDB == nil {
+ 		return
+ 	}
+ 	md := vsMD(ctx)
+-	id := media.GetId_INPUTDOCUMENT().GetId()
+-	if md == nil || id == 0 {
++	u, ok := resp.(*mtproto.Updates)
++	if md == nil || !ok {
+ 		return
+ 	}
+-	d := vsDoc(ctx, id)
+-	if d == nil {
++	for _, up := range u.GetUpdates() {
++		m := up.GetMessage_MESSAGE()
++		if m == nil {
++			continue
++		}
++		d := m.GetMedia().GetDocument()
++		if d == nil || d.GetId() == 0 {
++			continue
++		}
++		if _, ok := vsDocAlt(d); ok {
++			vsUserDocAdd(ctx, md.UserId, vsstickers.ListRecent, d.GetId(), vsstickers.MaxRecent)
++			vsNotifyMe(ctx, mtproto.MakeTLUpdateRecentStickers(&mtproto.Update{}).To_Update())
++		} else if vsDocIsGif(d) {
++			vsUserDocAdd(ctx, md.UserId, vsstickers.ListGifs, d.GetId(), vsstickers.MaxGifs)
++			vsNotifyMe(ctx, mtproto.MakeTLUpdateSavedGifs(&mtproto.Update{}).To_Update())
++			vsGifIndexAdd(ctx, d, caption)
++		}
+ 		return
+ 	}
+-	if _, ok := vsDocAlt(d); ok {
+-		vsUserDocAdd(ctx, md.UserId, vsstickers.ListRecent, id, vsstickers.MaxRecent)
+-		vsNotifyMe(ctx, mtproto.MakeTLUpdateRecentStickers(&mtproto.Update{}).To_Update())
+-	} else if vsDocIsGif(d) {
+-		vsUserDocAdd(ctx, md.UserId, vsstickers.ListGifs, id, vsstickers.MaxGifs)
+-		vsNotifyMe(ctx, mtproto.MakeTLUpdateSavedGifs(&mtproto.Update{}).To_Update())
+-	}
+ }
+ 
+ // --- свои наборы: атрибуты документа ---
+diff --git a/app/tools/vsstickers/main.go b/app/tools/vsstickers/main.go
+index 34630b1..2716cca 100644
+--- a/app/tools/vsstickers/main.go
++++ b/app/tools/vsstickers/main.go
+@@ -200,6 +200,7 @@ func main() {
+ 	// Большие анимированные смайлы (inputStickerSetAnimatedEmoji): все стикеры, служебный набор.
+ 	aeId := vsstickers.OfficialSetIdBase + 0xFFFF
+ 	saveSet(ctx, db, aeId, setAccessHash(aeId), AnimatedEmojiShortName, "Animated Emoji", 2, vsstickers.KindAnimated, 0, allItems, now)
++	ensureGifBot(ctx, db, rds)
+ 	fmt.Printf("анимированные смайлы: %d\nфайлов загружено %d, уже были %d\nИсточник: %s\nГОТОВО\n", len(allItems), uploaded, skipped, man.Source)
+ }
+ 
+@@ -224,3 +225,42 @@ func saveSet(ctx context.Context, db *sql.DB, setId, hash int64, short, title st
+ 		must(err, "items insert")
+ 	}
+ }
++
++// ensureGifBot — служебный бот @gif для поиска GIF (как в Telegram: gif_search_username = gif).
++func ensureGifBot(ctx context.Context, db *sql.DB, rds []*redis.Redis) {
++	id := vsstickers.GifBotId
++	var name string
++	err := db.QueryRowContext(ctx, "select username from users where id = ?", id).Scan(&name)
++	switch {
++	case err == sql.ErrNoRows:
++		_, err = db.ExecContext(ctx, "insert into users(id, user_type, access_hash, first_name, last_name, username, phone, country_code, is_bot, about) values (?, 3, ?, 'GIF', '', ?, '', '', 1, ?)",
++			id, setAccessHash(id), vsstickers.GifBotUsername, "Поиск GIF в VSети")
++		must(err, "users @gif")
++	case err != nil:
++		must(err, "users @gif select")
++	case name != vsstickers.GifBotUsername:
++		fmt.Printf("ВНИМАНИЕ: id %d занят пользователем %q — бот @gif не создан\n", id, name)
++		return
++	}
++	var n int
++	_ = db.QueryRowContext(ctx, "select count(*) from bots where bot_id = ?", id).Scan(&n)
++	if n == 0 {
++		_, err = db.ExecContext(ctx, "insert into bots(bot_id, bot_type, creator_user_id, bot_nochats, bot_inline_placeholder) values (?, 1, 0, 1, ?)", id, vsstickers.GifBotPlaceholder)
++		must(err, "bots @gif")
++	} else {
++		_, _ = db.ExecContext(ctx, "update bots set bot_inline_placeholder = ? where bot_id = ?", vsstickers.GifBotPlaceholder, id)
++	}
++	var peer int64
++	err = db.QueryRowContext(ctx, "select peer_id from username where username = ? and deleted = 0", vsstickers.GifBotUsername).Scan(&peer)
++	switch {
++	case err == sql.ErrNoRows:
++		_, err = db.ExecContext(ctx, "insert into username(username, peer_type, peer_id) values (?, 2, ?)", vsstickers.GifBotUsername, id)
++		must(err, "username @gif")
++	case err == nil && peer != id:
++		fmt.Printf("ВНИМАНИЕ: имя @gif уже занято (peer %d)\n", peer)
++	}
++	for _, r := range rds {
++		_, _ = r.Del(fmt.Sprintf("user_%d", id), fmt.Sprintf("bots_%d", id))
++	}
++	fmt.Println("бот @gif готов")
++}
+diff --git a/pkg/vsstickers/vsstickers.go b/pkg/vsstickers/vsstickers.go
+index c838d22..61de99a 100644
+--- a/pkg/vsstickers/vsstickers.go
++++ b/pkg/vsstickers/vsstickers.go
+@@ -155,3 +155,22 @@ func StorageType(mime string) int32 {
+ 	}
+ 	return int32(mtproto.TLConstructor_CRC32_storage_fileUnknown)
+ }
++
++// ---------- GIF: служебный бот @gif и своя база гифок ----------
++
++const (
++	GifBotId          = int64(777010)
++	GifBotUsername    = "gif"
++	GifBotPlaceholder = "Поиск GIF"
++)
++
++// GifSchema — индекс гифок, которые отправляли в VSети (слова из подписи и имени файла, популярность).
++var GifSchema = "CREATE TABLE IF NOT EXISTS `vs_gif_index` (" +
++	"`document_id` bigint NOT NULL, `words` varchar(512) NOT NULL DEFAULT '', " +
++	"`uses` int NOT NULL DEFAULT 0, `last_used` int NOT NULL DEFAULT 0, " +
++	"PRIMARY KEY (`document_id`), KEY `uses` (`uses`, `last_used`)" +
++	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
++
++func init() {
++	Schema = append(Schema, GifSchema)
++}
