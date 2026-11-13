@@ -38,13 +38,14 @@ fi
 # 3) session.yaml: маршруты стикеров и GIF → bff
 sudo cp $B/session.yaml $W/session.yaml; sudo chown $(id -u) $W/session.yaml
 sed -i -e 's|#"/mtproto.RPCStickers": "bff.bff"|"/mtproto.RPCStickers": "bff.bff"|' \
-       -e 's|#"/mtproto.RPCGifs": "bff.bff"|"/mtproto.RPCGifs": "bff.bff"|' $W/session.yaml
+       -e 's|#"/mtproto.RPCGifs": "bff.bff"|"/mtproto.RPCGifs": "bff.bff"|' \
+       -e 's|#"/mtproto.RPCInlineBot": "bff.bff"|"/mtproto.RPCInlineBot": "bff.bff"|' $W/session.yaml
 CHANGED_SESSION=0
 if ! cmp -s $W/session.yaml $B/session.yaml; then
   sudo docker cp $W/session.yaml $C:/app/etc2/session.yaml
   CHANGED_SESSION=1
 fi
-grep -n 'RPCStickers\|RPCGifs' $W/session.yaml
+grep -n 'RPCStickers\|RPCGifs\|RPCInlineBot' $W/session.yaml
 
 # 4) новый bff и перезапуск session
 /usr/local/bin/vseti-update.sh bff
